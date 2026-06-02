@@ -1,0 +1,9 @@
+yfinance>=0.2.40
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+lxml>=5.0
+pyarrow>=15.0
+requests>=2.31
+fastapi>=0.110
+uvicorn[standard]>=0.27

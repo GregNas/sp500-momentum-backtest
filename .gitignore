@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+cache/
+presets/
+momentum_output/
+.playwright-mcp/
+.claude/
+backtest-result.png
+v1-*.png
