@@ -15,6 +15,10 @@
   * { box-sizing: border-box; }
   input, button, select { font-family: inherit; }
   input:focus { border-color: #6366f1 !important; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+  }
 </style>
 
 <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
@@ -55,6 +59,7 @@ function VariationSwitcher({ variation, setVariation }) {
     }}>
       {opts.map(o => (
         <button key={o.id} onClick={() => setVariation(o.id)}
+          aria-pressed={variation === o.id}
           style={{
             padding: '5px 11px', fontSize: 11, fontWeight: 600,
             background: variation === o.id ? '#1c1917' : 'transparent',
@@ -76,6 +81,13 @@ function App() {
   const [status, setStatus] = useState(null);
   const [error, setError] = useState(null);
   const [cacheInfo, setCacheInfo] = useState(null);
+  const [cacheNotice, setCacheNotice] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [progressMsg, setProgressMsg] = useState(null);
+  const [universes, setUniverses] = useState(null);
+
+  // Universe sizes + parameter ranges for client-side validation.
+  useEffect(() => { fetchUniverses().then(setUniverses); }, []);
   const [variation, setVariation] = useState(() => {
     const fromHash = (window.location.hash || '').replace('#', '');
     return fromHash === 'v2' ? 'v2' : 'v1';
@@ -94,14 +106,23 @@ function App() {
 
   useEffect(() => { refreshCache(); }, [refreshCache]);
 
+  // Tick an elapsed-seconds counter while a run is in flight.
+  useEffect(() => {
+    if (!running) return;
+    setElapsed(0);
+    const t = setInterval(() => setElapsed(s => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+
   const onRun = useCallback(async () => {
     if (running) return;
     setRunning(true);
     setError(null);
-    setStatus('running…');
+    setStatus(null);
+    setProgressMsg(null);
     const t0 = performance.now();
     try {
-      const result = await runBacktest(params);
+      const result = await runBacktest(params, setProgressMsg);
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       setData(result);
       const cacheStatus = (result.status_messages || []).some(m => m.toLowerCase().includes('cache hit'))
@@ -117,14 +138,26 @@ function App() {
   }, [params, running, refreshCache]);
 
   const onClearCache = useCallback(async () => {
+    setCacheNotice('Clearing…');
     await clearCache();
     await refreshCache();
+    setCacheNotice('Cache cleared');
+    setTimeout(() => setCacheNotice(null), 2500);
   }, [refreshCache]);
+
+  // While running, prefer real server progress; fall back to staged hint text.
+  const displayStatus = running
+    ? (progressMsg
+        ? `${progressMsg} · ${elapsed}s`
+        : (elapsed < 3
+            ? 'starting…'
+            : `fetching prices — cold runs pull ~500 tickers (~60 s) · ${elapsed}s`))
+    : status;
 
   const dashProps = {
     params, setParam,
-    data, status, running, error,
-    cacheInfo, onRun, onClearCache,
+    data, status: displayStatus, running, error, elapsed,
+    cacheInfo, cacheNotice, universes, onRun, onClearCache,
   };
 
   return (

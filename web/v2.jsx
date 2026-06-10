@@ -42,7 +42,9 @@ const UNIVERSE_NOUN = {
   us_sector_etfs: 'US sector ETFs',
 };
 
-function V2Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }) {
+function V2Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cacheNotice,
+                     universes, compact, onClearCache }) {
+  const issues = paramIssues(params, universes);
   const onUniverseChange = (u) => {
     const d = UNIVERSE_DEFAULTS[u];
     if (d) Object.entries(d).forEach(([k, v]) => setParam(k, v));
@@ -62,7 +64,7 @@ function V2Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
 
   return (
     <aside style={{
-      width: 240, padding: '20px 18px',
+      width: compact ? 210 : 240, flexShrink: 0, padding: compact ? '16px 12px' : '20px 18px',
       borderRight: `1px solid ${v2Theme.border}`,
       background: '#f6f3eb',
       display: 'flex', flexDirection: 'column', gap: 14,
@@ -81,8 +83,8 @@ function V2Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
       </div>
 
       <div>
-        <div style={labelStyle}>Universe</div>
-        <select value={params.universe || 'sp500'}
+        <label htmlFor="v2-universe" style={{ ...labelStyle, display: 'block' }}>Universe</label>
+        <select id="v2-universe" value={params.universe || 'sp500'}
                 onChange={e => onUniverseChange(e.target.value)}
                 style={{ ...inputBase, fontFamily: 'inherit' }}>
           {UNIVERSE_OPTIONS.map(o => (
@@ -91,22 +93,21 @@ function V2Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
         </select>
       </div>
 
-      <div>
-        <div style={labelStyle}>History</div>
-        <input type="number" value={params.lookback} min={1} max={25}
-               onChange={e => setParam('lookback', +e.target.value)}
-               style={inputBase} />
-      </div>
+      <NumField id="v2-lookback" label="History" value={params.lookback}
+                min={1} max={25} help={PARAM_HELP.lookback}
+                onChange={v => setParam('lookback', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+
+      <NumField id="v2-topn" label="Top N" value={params.topN}
+                min={1} max={maxTopNFor(universes, params.universe)} help={PARAM_HELP.topN}
+                onChange={v => setParam('topN', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
 
       <div>
-        <div style={labelStyle}>Top N</div>
-        <input type="number" value={params.topN} min={1} max={100}
-               onChange={e => setParam('topN', +e.target.value)}
-               style={inputBase} />
-      </div>
-
-      <div>
-        <div style={labelStyle}>Hold periods</div>
+        <div style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+          Hold periods
+          <HelpTip help={PARAM_HELP.holds} theme={v2Theme} />
+        </div>
         <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
           {[1, 2, 3, 6, 9, 12].map(h => {
             const on = params.holds.includes(h);
@@ -131,60 +132,71 @@ function V2Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
         </div>
       </div>
 
-      <div>
-        <div style={labelStyle}>Rank lookback</div>
-        <input type="number" value={params.rankLookback} min={1} max={12}
-               onChange={e => setParam('rankLookback', +e.target.value)}
-               style={inputBase} />
-      </div>
+      <NumField id="v2-ranklb" label="Rank lookback" value={params.rankLookback}
+                min={1} max={12} help={PARAM_HELP.rankLookback}
+                onChange={v => setParam('rankLookback', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+
+      <NumField id="v2-horizon" label="Event horizon" value={params.horizon}
+                min={1} max={24} help={PARAM_HELP.horizon}
+                onChange={v => setParam('horizon', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
 
       <div>
-        <div style={labelStyle}>Event horizon</div>
-        <input type="number" value={params.horizon} min={1} max={24}
-               onChange={e => setParam('horizon', +e.target.value)}
-               style={inputBase} />
-      </div>
-
-      <div>
-        <div style={labelStyle}>Benchmark</div>
-        <input type="text" value={params.benchmark}
+        <label htmlFor="v2-benchmark"
+               style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+          Benchmark
+          <HelpTip help={PARAM_HELP.benchmark} theme={v2Theme} />
+        </label>
+        <input id="v2-benchmark" type="text" value={params.benchmark}
                onChange={e => setParam('benchmark', e.target.value.toUpperCase())}
                style={inputBase} />
       </div>
 
-      <button onClick={onRun} disabled={running}
+      <button onClick={onRun} disabled={running || issues.length > 0}
               style={{
                 padding: '8px 12px', fontSize: 12, fontWeight: 600,
-                background: running ? v2Theme.muted : v2Theme.text, color: '#fff',
+                background: (running || issues.length) ? v2Theme.muted : v2Theme.text,
+                color: '#fff',
                 border: 'none', borderRadius: 4,
-                cursor: running ? 'wait' : 'pointer',
+                cursor: running ? 'wait' : (issues.length ? 'not-allowed' : 'pointer'),
                 letterSpacing: '0.04em',
               }}>
-        {running ? 'RUNNING…' : 'RUN BACKTEST'}
+        {running ? `RUNNING… ${elapsed || 0}s` : 'RUN BACKTEST'}
       </button>
+      {issues.length > 0 && !running && (
+        <div style={{ fontSize: 10.5, color: '#b91c1c', marginTop: -6 }}>
+          {issues[0]}
+        </div>
+      )}
 
       <div style={{ paddingTop: 8 }}>
         <div style={labelStyle}>Cache</div>
         <div style={{ fontSize: 10.5, color: v2Theme.muted,
                        fontFamily: 'JetBrains Mono, monospace', lineHeight: 1.7 }}>
           {cacheInfo
-            ? <>{cacheInfo.start} → {cacheInfo.end}<br/>{cacheInfo.n_tickers} tickers</>
+            ? <>{cacheInfo.start} → {cacheInfo.end}<br/>{cacheInfo.n_tickers} tickers
+                {cacheInfo.age_hours != null && <><br/>updated {fmtAge(cacheInfo.age_hours)} · {cacheInfo.is_fresh
+                  ? <span style={{ color: '#047857' }}>fresh</span>
+                  : <span title="Next run re-pulls the last 2 days">stale</span>}</>}
+              </>
             : <>Empty — first run cold-fetches.</>}
         </div>
-        <button onClick={onClearCache} style={{
+        <button onClick={onClearCache} disabled={cacheNotice === 'Clearing…'} style={{
           marginTop: 6, width: '100%', padding: '4px 6px', fontSize: 10.5,
           background: '#fff', color: v2Theme.muted,
-          border: `1px solid ${v2Theme.border}`, borderRadius: 3, cursor: 'pointer',
+          border: `1px solid ${v2Theme.border}`, borderRadius: 3,
+          cursor: cacheNotice === 'Clearing…' ? 'wait' : 'pointer',
           fontFamily: 'JetBrains Mono, monospace',
         }}>
-          clear
+          {cacheNotice ? cacheNotice.toLowerCase() : 'clear'}
         </button>
       </div>
     </aside>
   );
 }
 
-function V2EmptyState({ onRun, running, error }) {
+function V2EmptyState({ onRun, running, error, elapsed, status }) {
   return (
     <div style={{
       flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -196,11 +208,17 @@ function V2EmptyState({ onRun, running, error }) {
       }}>
         <div style={{ fontSize: 22, fontWeight: 700,
                        fontFamily: '"Source Serif Pro", Georgia, serif',
-                       color: v2Theme.text, marginBottom: 8 }}>
-          {error ? 'Backtest failed' : (running ? 'Running…' : 'No backtest yet')}
+                       color: v2Theme.text, marginBottom: 8,
+                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          {running && (
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: v2Accent.dark,
+                            animation: 'pulse 1.2s ease-in-out infinite' }} />
+          )}
+          {error ? 'Backtest failed' : (running ? `Running… ${elapsed || 0}s` : 'No backtest yet')}
         </div>
         <div style={{ fontSize: 13, color: v2Theme.muted, lineHeight: 1.6, marginBottom: 20 }}>
-          {error || 'Pick parameters in the sidebar, then run the backtest. Cold runs pull ~500 tickers (~60 s); cache hits return in under a second.'}
+          {error || (running && status)
+            || 'Pick parameters in the sidebar, then run the backtest. Cold runs pull ~500 tickers (~60 s); cache hits return in under a second.'}
         </div>
         {!running && (
           <button onClick={onRun} style={{
@@ -215,14 +233,19 @@ function V2EmptyState({ onRun, running, error }) {
   );
 }
 
-function V2Dashboard({ params, setParam, data, status, running, error,
-                       cacheInfo, onRun, onClearCache }) {
+function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
+                       cacheInfo, cacheNotice, universes, onRun, onClearCache }) {
   const [hoverIdx, setHoverIdx] = useStateV2(null);
+  const [pinnedIdx, setPinnedIdx] = useStateV2(null);
   const [logScale, setLogScale] = useStateV2(true);
   const [filled, setFilled] = useStateV2(true);
   const [esView, setEsView] = useStateV2('alpha');
+  const { isNarrow, isCompact } = useViewport();
 
-  useEffectV2(() => { setHoverIdx(null); }, [data]);
+  useEffectV2(() => { setHoverIdx(null); setPinnedIdx(null); }, [data]);
+
+  // Hover takes precedence; a click pins a month for comparison.
+  const activeIdx = hoverIdx != null ? hoverIdx : pinnedIdx;
 
   const ready = data && data.PERF && data.EQUITY;
 
@@ -316,27 +339,38 @@ function V2Dashboard({ params, setParam, data, status, running, error,
       fontSize: 12, lineHeight: 1.5,
     }}>
       <V2Sidebar params={params} setParam={setParam}
-                 onRun={onRun} running={running}
-                 cacheInfo={cacheInfo} onClearCache={onClearCache} />
+                 onRun={onRun} running={running} elapsed={elapsed}
+                 cacheInfo={cacheInfo} cacheNotice={cacheNotice}
+                 universes={universes} compact={isCompact}
+                 onClearCache={onClearCache} />
 
       <main style={{ flex: 1, padding: 22, overflow: 'auto', display: 'flex',
                      flexDirection: 'column', gap: 16 }}>
         <TopPerformersPanel theme={v2Theme} accent={v2Accent}
                             headingFont='"Source Serif Pro", Georgia, serif'
-                            universe={params.universe || 'sp500'} />
+                            universe={params.universe || 'sp500'}
+                            cacheInfo={cacheInfo} universes={universes} />
 
         {!ready ? (
-          <V2EmptyState onRun={onRun} running={running} error={error} />
+          <V2EmptyState onRun={onRun} running={running} error={error}
+                        elapsed={elapsed} status={status} />
         ) : (
           <>
           {/* Editorial header bar */}
           <div style={{
             display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end',
             borderBottom: `1px solid ${v2Theme.border}`, paddingBottom: 12,
+            flexWrap: 'wrap', gap: 12,
           }}>
             <div>
-              <div style={{ fontSize: 10, fontWeight: 700, color: v2Accent.dark,
-                             letterSpacing: '0.15em', textTransform: 'uppercase' }}>
+              <div role="status" aria-live="polite"
+                   style={{ fontSize: 10, fontWeight: 700, color: v2Accent.dark,
+                             letterSpacing: '0.15em', textTransform: 'uppercase',
+                             display: 'flex', alignItems: 'center', gap: 6 }}>
+                {running && (
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: v2Accent.dark,
+                                  animation: 'pulse 1.2s ease-in-out infinite' }} />
+                )}
                 {status ? `Run · ${status}` : 'Backtest console'}
               </div>
               <div style={{ fontSize: 26, fontWeight: 700, marginTop: 2,
@@ -369,7 +403,8 @@ function V2Dashboard({ params, setParam, data, status, running, error,
           </div>
 
           {/* Hero: equity curve with side rail */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px', gap: 16 }}>
+          <div style={{ display: 'grid',
+                         gridTemplateColumns: isNarrow ? '1fr' : '1fr 220px', gap: 16 }}>
             <div style={{
               background: v2Theme.card, border: `1px solid ${v2Theme.border}`,
               borderRadius: 6, padding: '14px 16px',
@@ -400,14 +435,17 @@ function V2Dashboard({ params, setParam, data, status, running, error,
                   series={equitySeries} months={months}
                   logScale={logScale} filled={filled}
                   theme={v2Theme} accent={v2Accent}
-                  hoveredIdx={hoverIdx} onHover={setHoverIdx}
+                  hoveredIdx={activeIdx} onHover={setHoverIdx}
+                  onSelect={i => setPinnedIdx(p => (p === i ? null : i))}
+                  ariaLabel={`Equity curves, ${equitySeries.length} series vs ${params.benchmark}, ${monthRange}`}
                 />
               </div>
               {bestKey && data.DRAWDOWN[bestKey] && (
                 <div style={{ height: 90, marginTop: 4,
                                borderTop: `1px dashed ${v2Theme.border}`, paddingTop: 4 }}>
                   <DrawdownChart series={data.DRAWDOWN[bestKey]} months={months}
-                                 theme={v2Theme} accent={v2Accent} height={90} />
+                                 theme={v2Theme} accent={v2Accent} height={90}
+                                 label={bestStrat.strategy} />
                 </div>
               )}
               <div style={{ display: 'flex', gap: 14, marginTop: 6, paddingLeft: 56,
@@ -417,23 +455,37 @@ function V2Dashboard({ params, setParam, data, status, running, error,
                   <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <span style={{ width: 10, height: 2, background: s.color }} />
                     <span style={{ color: v2Theme.text, fontWeight: 500 }}>{s.name}</span>
-                    <span>{fmtMult(hoverIdx != null ? s.values[hoverIdx] : s.values[s.values.length - 1])}</span>
+                    <span>{fmtMult(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
                   </div>
                 ))}
-                {hoverIdx != null && months[hoverIdx] && (
-                  <div style={{ marginLeft: 'auto', color: v2Theme.text, fontWeight: 600 }}>
-                    {fmtMonthYear(months[hoverIdx])}
+                {activeIdx != null && months[activeIdx] && (
+                  <div style={{ marginLeft: 'auto', color: v2Theme.text, fontWeight: 600,
+                                 display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {fmtMonthYear(months[activeIdx])}
+                    {pinnedIdx != null && (
+                      <button onClick={() => setPinnedIdx(null)}
+                              aria-label="Clear pinned month"
+                              style={{ border: `1px solid ${v2Theme.border}`, background: '#fff',
+                                       color: v2Theme.muted, borderRadius: 3, cursor: 'pointer',
+                                       fontSize: 10, padding: '1px 5px', lineHeight: 1.4,
+                                       fontWeight: 400 }}>
+                        pinned ✕
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Side rail */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {/* Side rail — stacks beside the chart, wraps beneath it when narrow */}
+            <div style={{ display: 'flex',
+                           flexDirection: isNarrow ? 'row' : 'column',
+                           flexWrap: isNarrow ? 'wrap' : 'nowrap', gap: 10 }}>
               {bestStrat && (
                 <div style={{
                   background: v2Accent.dark, color: '#fff',
                   borderRadius: 6, padding: '14px 16px',
+                  flex: isNarrow ? '1 1 200px' : 'none',
                 }}>
                   <div style={{ fontSize: 10, opacity: 0.75, letterSpacing: '0.06em',
                                  textTransform: 'uppercase', fontWeight: 600 }}>
@@ -455,6 +507,7 @@ function V2Dashboard({ params, setParam, data, status, running, error,
                 <div style={{
                   background: v2Theme.card, border: `1px solid ${v2Theme.border}`,
                   borderRadius: 6, padding: '12px 14px',
+                  flex: isNarrow ? '1 1 200px' : 'none',
                 }}>
                   <div style={{ fontSize: 10, color: v2Theme.muted, letterSpacing: '0.06em',
                                  textTransform: 'uppercase', fontWeight: 600 }}>
@@ -493,6 +546,7 @@ function V2Dashboard({ params, setParam, data, status, running, error,
               <div style={{
                 background: v2Theme.card, border: `1px solid ${v2Theme.border}`,
                 borderRadius: 6, padding: '12px 14px',
+                flex: isNarrow ? '1 1 200px' : 'none',
               }}>
                 <div style={{ fontSize: 10, color: v2Theme.muted, letterSpacing: '0.06em',
                                textTransform: 'uppercase', fontWeight: 600 }}>
@@ -523,7 +577,8 @@ function V2Dashboard({ params, setParam, data, status, running, error,
           </div>
 
           {/* Two-up: event study + recent picks */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16 }}>
+          <div style={{ display: 'grid',
+                         gridTemplateColumns: isNarrow ? '1fr' : '1.4fr 1fr', gap: 16 }}>
             <div style={{
               background: v2Theme.card, border: `1px solid ${v2Theme.border}`,
               borderRadius: 6, padding: '14px 16px',
@@ -553,7 +608,8 @@ function V2Dashboard({ params, setParam, data, status, running, error,
                 </div>
               </div>
               <div style={{ fontSize: 11, color: v2Theme.muted, marginBottom: 8 }}>
-                Forward return at horizon h after a top-{params.topN} cohort is selected. n={cohortCount} cohorts.
+                Forward return at horizon h after a top-{params.topN} cohort is selected.
+                n={cohortCount} cohorts. Dark bars clear |t| ≥ 2 (5% significance).
               </div>
               <div style={{ height: 220 }}>
                 <EventStudyChart
@@ -636,8 +692,16 @@ function V2Dashboard({ params, setParam, data, status, running, error,
             </div>
           </div>
 
+          {/* Monthly rebalance trade list */}
+          <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}
+                          rankLookback={params.rankLookback}
+                          universe={params.universe || 'sp500'}
+                          theme={v2Theme} accent={v2Accent}
+                          headingFont='"Source Serif Pro", Georgia, serif' />
+
           {/* Rolling Sharpe + Underwater (two-up) */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <div style={{ display: 'grid',
+                         gridTemplateColumns: isNarrow ? '1fr' : '1fr 1fr', gap: 16 }}>
             <div style={{
               background: v2Theme.card, border: `1px solid ${v2Theme.border}`,
               borderRadius: 6, padding: '14px 16px',
@@ -743,7 +807,7 @@ function V2Dashboard({ params, setParam, data, status, running, error,
                 </span>
               </div>
               <MonthlyHeatmap returns={heatmapValues} months={months}
-                              theme={v2Theme} accent={v2Accent} />
+                              theme={v2Theme} accent={v2Accent} compact={isCompact} />
             </div>
           )}
 

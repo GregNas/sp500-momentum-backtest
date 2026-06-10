@@ -5,6 +5,20 @@
 const { useMemo, useState, useRef, useEffect } = React;
 
 // ============================================================
+// useViewport — shared breakpoints for laptop-friendly layouts.
+// The codebase styles inline, so breakpoints live here instead of media queries.
+// ============================================================
+function useViewport() {
+  const [width, setWidth] = useState(window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  return { width, isNarrow: width < 1100, isCompact: width < 900 };
+}
+
+// ============================================================
 // EquityCurveChart — log-scale line chart of strategies vs benchmark
 // ============================================================
 function EquityCurveChart({
@@ -17,6 +31,8 @@ function EquityCurveChart({
   accent,
   hoveredIdx,
   onHover,
+  onSelect,          // click-to-pin: called with the month index under the cursor
+  ariaLabel,
 }) {
   const W = 1000, H = height;
   const padL = 56, padR = 16, padT = 16, padB = 28;
@@ -60,16 +76,21 @@ function EquityCurveChart({
     return out;
   }, [months]);
 
+  const idxFromEvent = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * W;
+    const i = Math.round(((x - padL) / innerW) * (months.length - 1));
+    return Math.max(0, Math.min(months.length - 1, i));
+  };
+
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
-         style={{ width: '100%', height: '100%', display: 'block', overflow: 'visible' }}
-         onMouseMove={(e) => {
-           const rect = e.currentTarget.getBoundingClientRect();
-           const x = ((e.clientX - rect.left) / rect.width) * W;
-           const i = Math.round(((x - padL) / innerW) * (months.length - 1));
-           onHover?.(Math.max(0, Math.min(months.length - 1, i)));
-         }}
+         role="img" aria-label={ariaLabel || 'Equity curve chart'}
+         style={{ width: '100%', height: '100%', display: 'block', overflow: 'visible',
+                  cursor: onSelect ? 'pointer' : 'default' }}
+         onMouseMove={(e) => onHover?.(idxFromEvent(e))}
          onMouseLeave={() => onHover?.(null)}
+         onClick={onSelect ? (e) => onSelect(idxFromEvent(e)) : undefined}
     >
       {/* Y grid + labels */}
       {yTicks.map((t, i) => (
@@ -132,7 +153,8 @@ function EquityCurveChart({
 // ============================================================
 // EventStudyChart — bar chart of avg forward return + significance
 // ============================================================
-function EventStudyChart({ data, height = 280, theme, accent, showWinRate = false, benchmarkAvg = 0 }) {
+function EventStudyChart({ data, height = 280, theme, accent, showWinRate = false,
+                           benchmarkAvg = 0, ariaLabel }) {
   const W = 1000, H = height;
   const padL = 56, padR = 16, padT = 24, padB = 36;
   const innerW = W - padL - padR;
@@ -153,6 +175,10 @@ function EventStudyChart({ data, height = 280, theme, accent, showWinRate = fals
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+         role="img"
+         aria-label={ariaLabel || (showWinRate
+           ? 'Event study bar chart of win rate by horizon'
+           : 'Event study bar chart of average forward return by horizon')}
          style={{ width: '100%', height: '100%', display: 'block' }}>
       {/* Y grid + labels */}
       {yTicks.filter(t => t <= max).map((t, i) => (
@@ -209,7 +235,7 @@ function EventStudyChart({ data, height = 280, theme, accent, showWinRate = fals
 // ============================================================
 // DrawdownChart — underwater plot
 // ============================================================
-function DrawdownChart({ series, months, height = 140, theme, accent }) {
+function DrawdownChart({ series, months, height = 140, theme, accent, label }) {
   const W = 1000, H = height;
   const padL = 56, padR = 16, padT = 12, padB = 24;
   const innerW = W - padL - padR;
@@ -231,6 +257,8 @@ function DrawdownChart({ series, months, height = 140, theme, accent }) {
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+         role="img"
+         aria-label={`Drawdown chart${label ? ` for ${label}` : ''}, maximum drawdown ${(min * 100).toFixed(1)}%`}
          style={{ width: '100%', height: '100%', display: 'block' }}>
       {yTicks.map((t, i) => (
         <g key={i}>
@@ -245,6 +273,15 @@ function DrawdownChart({ series, months, height = 140, theme, accent }) {
 
       <path d={fillPath} fill={accent.color} opacity="0.18" />
       <path d={path} fill="none" stroke={accent.color} strokeWidth="1.5" />
+
+      {/* Which series is plotted (only the best sleeve is shown) */}
+      {label && (
+        <text x={W - padR - 4} y={padT + 10} textAnchor="end"
+              fontSize="10" fill={theme.axis}
+              fontFamily="JetBrains Mono, monospace">
+          drawdown · {label}
+        </text>
+      )}
 
       {/* Max DD marker */}
       <circle cx={xAt(minIdx)} cy={yAt(min)} r="3.5"
@@ -306,6 +343,8 @@ function RollingSharpeChart({
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+         role="img"
+         aria-label={`Rolling 12-month Sharpe ratio chart, ${series.length} series`}
          style={{ width: '100%', height: '100%', display: 'block' }}>
       {yTicks.map((t, i) => (
         <g key={i}>
@@ -406,6 +445,8 @@ function UnderwaterChart({
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+         role="img"
+         aria-label={`Underwater drawdown chart, ${series.length} series, deepest ${(min * 100).toFixed(1)}%`}
          style={{ width: '100%', height: '100%', display: 'block' }}>
       {yTicks.map((t, i) => (
         <g key={i}>
@@ -537,6 +578,13 @@ function MonthlyHeatmap({ returns, months, theme, accent, compact = false }) {
     }
   };
 
+  // Hue-preserving dark text on light cells; white only once the fill is saturated.
+  const textColorFor = (v) => {
+    if (v == null) return theme.text;
+    if (Math.abs(v) > 0.10) return '#fff';
+    return v >= 0 ? '#064e3b' : '#7f1d1d';
+  };
+
   const cellH = compact ? 22 : 28;
   const labelW = 44;
 
@@ -573,10 +621,10 @@ function MonthlyHeatmap({ returns, months, theme, accent, compact = false }) {
                        borderRadius: 3,
                        display: 'flex', alignItems: 'center', justifyContent: 'center',
                        fontSize: 9.5,
-                       color: v != null && Math.abs(v) > 0.08 ? '#fff' : theme.text,
+                       color: textColorFor(v),
                        fontWeight: 500,
                      }}>
-                  {v != null ? `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}` : ''}
+                  {v != null && !compact ? `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}` : ''}
                 </div>
               );
             })}
@@ -591,6 +639,20 @@ function MonthlyHeatmap({ returns, months, theme, accent, compact = false }) {
           </div>
         );
       })}
+      {/* Color-scale legend */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, fontSize: 10 }}>
+        <span>Monthly return</span>
+        {[-0.15, -0.075, 0, 0.075, 0.15].map(v => (
+          <span key={v} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+            <span style={{
+              width: 14, height: 10, borderRadius: 2, display: 'inline-block',
+              background: colorFor(v), border: `1px solid ${theme.grid}`,
+            }} />
+            {`${v > 0 ? '+' : ''}${(v * 100).toFixed(0)}%`}
+          </span>
+        ))}
+        <span style={{ color: theme.muted || theme.axis }}>capped at ±15%</span>
+      </div>
     </div>
   );
 }
@@ -613,38 +675,327 @@ function Sparkline({ values, color, width = 80, height = 22 }) {
 }
 
 // ============================================================
+// Parameter help + validated numeric input (shared by V1/V2 sidebars)
+// ============================================================
+const PARAM_HELP = {
+  lookback: 'Years of price history the backtest runs over.',
+  topN: 'How many of the highest-momentum names go into the portfolio each month.',
+  holds: 'How long each monthly cohort is held, in months. Multiple selections run as parallel sleeves.',
+  rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
+  horizon: 'How many months forward the event study tracks each cohort after selection.',
+  benchmark: 'Ticker the strategy is measured against.',
+  topPerfN: 'How many tickers to show in the leaderboard.',
+  topPerfDays: 'Calendar-day window the return is measured over.',
+};
+
+const DEFAULT_RANGES = {
+  lookback: { min: 1, max: 25 },
+  topN: { min: 1, max: 100 },
+  rankLookback: { min: 1, max: 12 },
+  horizon: { min: 1, max: 24 },
+};
+
+// Effective topN ceiling for the selected universe (server rejects topN >= size).
+function maxTopNFor(universesInfo, universeKey) {
+  const ranges = (universesInfo && universesInfo.ranges) || DEFAULT_RANGES;
+  const uni = universesInfo?.universes?.[universeKey || 'sp500'];
+  return uni?.max_topN != null ? Math.min(uni.max_topN, ranges.topN.max) : ranges.topN.max;
+}
+
+// Returns human-readable problems with the current params ([] = all good).
+function paramIssues(params, universesInfo) {
+  const ranges = (universesInfo && universesInfo.ranges) || DEFAULT_RANGES;
+  const topNMax = maxTopNFor(universesInfo, params.universe);
+  const issues = [];
+  const check = (key, label, min, max) => {
+    const v = params[key];
+    if (!Number.isFinite(v) || v < min || v > max) issues.push(`${label} must be ${min}–${max}`);
+  };
+  check('lookback', 'Lookback', ranges.lookback.min, ranges.lookback.max);
+  check('topN', 'Top N', ranges.topN.min, topNMax);
+  check('rankLookback', 'Rank lookback', ranges.rankLookback.min, ranges.rankLookback.max);
+  check('horizon', 'Event horizon', ranges.horizon.min, ranges.horizon.max);
+  if (!params.benchmark || !String(params.benchmark).trim()) issues.push('Benchmark ticker is required');
+  return issues;
+}
+
+function HelpTip({ help, theme }) {
+  const [open, setOpen] = useState(false);
+  if (!help) return null;
+  return (
+    <span style={{ position: 'relative', display: 'inline-flex' }}
+          onMouseEnter={() => setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      <span tabIndex={0} title={help}
+            onFocus={() => setOpen(true)} onBlur={() => setOpen(false)}
+            style={{ display: 'inline-flex', cursor: 'help', outline: 'none',
+                     color: theme.muted || theme.axis }}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
+          <line x1="12" y1="11" x2="12" y2="16.5" stroke="currentColor"
+                strokeWidth="2" strokeLinecap="round" />
+          <circle cx="12" cy="7.5" r="1.3" fill="currentColor" />
+        </svg>
+      </span>
+      {open && (
+        <span role="tooltip" style={{
+          position: 'absolute', bottom: '130%', left: -8, zIndex: 40,
+          width: 190, padding: '7px 9px', borderRadius: 5,
+          background: theme.text, color: '#fff',
+          fontSize: 11, fontWeight: 400, lineHeight: 1.5,
+          letterSpacing: 0, textTransform: 'none',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.18)', pointerEvents: 'none',
+        }}>
+          {help}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// Numeric input that flags out-of-range/empty values inline and clamps on blur.
+function NumField({ id, label, value, min, max, help, onChange,
+                    theme, labelStyle, inputStyle, wrapStyle }) {
+  const invalid = !Number.isFinite(value) || value < min || value > max;
+  return (
+    <div style={wrapStyle}>
+      <label htmlFor={id}
+             style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+        {label}
+        <HelpTip help={help} theme={theme} />
+      </label>
+      <input id={id} type="number" min={min} max={max}
+             value={Number.isFinite(value) ? value : ''}
+             onChange={e => onChange(e.target.value === '' ? NaN : +e.target.value)}
+             onBlur={() => {
+               if (invalid) onChange(Math.min(max, Math.max(min, Number.isFinite(value) ? value : min)));
+             }}
+             style={{ ...inputStyle, ...(invalid ? { border: '1px solid #dc2626' } : {}) }} />
+      {invalid && (
+        <div style={{ fontSize: 10, color: '#b91c1c', marginTop: 3,
+                       fontFamily: 'JetBrains Mono, monospace' }}>
+          {min}–{max}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// RebalancePanel — month-by-month trade list for the top-N portfolio:
+// what to buy, what to sell, what to keep. Latest month first (actionable),
+// older transitions below as history. CSV export for taking it to a broker.
+// ============================================================
+const REBAL_COLORS = {
+  buy:  { bg: '#ecfdf5', border: '#a7f3d0', text: '#047857' },
+  sell: { bg: '#fef2f2', border: '#fecaca', text: '#b91c1c' },
+};
+
+function RebalanceChip({ ticker, group, kind, theme, showGroup }) {
+  const c = REBAL_COLORS[kind] || { bg: theme.bg, border: theme.border, text: theme.text };
+  return (
+    <span title={group || undefined} style={{
+      padding: '2px 7px', fontSize: 11,
+      fontFamily: 'JetBrains Mono, monospace', fontWeight: 600,
+      background: c.bg, border: `1px solid ${c.border}`, color: c.text,
+      borderRadius: 4, display: 'inline-flex', gap: 4, alignItems: 'baseline',
+    }}>
+      {ticker}
+      {showGroup && group && (
+        <span style={{ fontFamily: 'Inter, sans-serif', fontWeight: 400,
+                        fontSize: 10, opacity: 0.75 }}>{group}</span>
+      )}
+    </span>
+  );
+}
+
+function RebalancePanel({ rebalance, topN, rankLookback, universe = 'sp500',
+                          theme, accent, headingFont }) {
+  if (!rebalance || !rebalance.length) return null;
+  const latest = rebalance[0];
+  const history = rebalance.slice(1);
+  const showGroup = universe !== 'sp500';
+
+  const downloadCsv = () => {
+    const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+    const rows = [['month', 'action', 'ticker', 'group']];
+    rebalance.forEach(r => {
+      r.buys.forEach(t => rows.push([r.month, 'BUY', t, r.meta?.[t] || '']));
+      r.sells.forEach(t => rows.push([r.month, 'SELL', t, r.meta?.[t] || '']));
+      r.holds.forEach(t => rows.push([r.month, 'KEEP', t, r.meta?.[t] || '']));
+    });
+    const csv = rows.map(r => r.map(q).join(',')).join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `rebalance_top${topN}_${latest.month}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const colTitle = (label, count, color) => (
+    <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+                   textTransform: 'uppercase', color, marginBottom: 6 }}>
+      {label} ({count})
+    </div>
+  );
+  const chipWrap = { display: 'flex', flexWrap: 'wrap', gap: 4 };
+
+  return (
+    <div style={{
+      background: theme.card, border: `1px solid ${theme.border}`,
+      borderRadius: 6, padding: '14px 16px',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between',
+                     alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 4 }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700,
+                         fontFamily: headingFont || 'inherit' }}>
+            Monthly rebalance · trade list
+          </div>
+          <div style={{ fontSize: 11, color: theme.muted, marginTop: 2, lineHeight: 1.5 }}>
+            Hold the top {topN} by prior {rankLookback}m return; rebalance in full at each
+            month-end close (the 1-month-hold sleeve). The top row is the current target
+            portfolio — it shifts as the month in progress accrues data.
+          </div>
+        </div>
+        <button onClick={downloadCsv} style={{
+          padding: '6px 12px', fontSize: 11, fontWeight: 600,
+          background: accent.dark, color: '#fff', border: 'none',
+          borderRadius: 4, cursor: 'pointer', flexShrink: 0,
+        }}>
+          Download CSV
+        </button>
+      </div>
+
+      {/* Latest month — the actionable trades */}
+      <div style={{
+        border: `1px solid ${theme.border}`, borderRadius: 6,
+        padding: '12px 14px', marginTop: 8, background: theme.bg,
+      }}>
+        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10,
+                       fontFamily: 'JetBrains Mono, monospace' }}>
+          {latest.month}
+          <span style={{ fontWeight: 400, color: theme.muted, marginLeft: 8,
+                          fontFamily: 'Inter, sans-serif', fontSize: 11 }}>
+            current target — {latest.buys.length} in, {latest.sells.length} out,
+            {' '}{latest.holds.length} unchanged
+          </span>
+        </div>
+        <div style={{ display: 'grid',
+                       gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
+                       gap: 14 }}>
+          <div>
+            {colTitle('Buy', latest.buys.length, REBAL_COLORS.buy.text)}
+            <div style={chipWrap}>
+              {latest.buys.map(t => <RebalanceChip key={t} ticker={t} kind="buy"
+                group={latest.meta?.[t]} theme={theme} showGroup={showGroup} />)}
+              {!latest.buys.length && <span style={{ fontSize: 11, color: theme.muted, fontStyle: 'italic' }}>nothing to buy</span>}
+            </div>
+          </div>
+          <div>
+            {colTitle('Sell', latest.sells.length, REBAL_COLORS.sell.text)}
+            <div style={chipWrap}>
+              {latest.sells.map(t => <RebalanceChip key={t} ticker={t} kind="sell"
+                group={latest.meta?.[t]} theme={theme} showGroup={showGroup} />)}
+              {!latest.sells.length && <span style={{ fontSize: 11, color: theme.muted, fontStyle: 'italic' }}>nothing to sell</span>}
+            </div>
+          </div>
+          <div>
+            {colTitle('Keep', latest.holds.length, theme.muted)}
+            <div style={chipWrap}>
+              {latest.holds.map(t => <RebalanceChip key={t} ticker={t} kind="keep"
+                group={latest.meta?.[t]} theme={theme} showGroup={showGroup} />)}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* History — previous month-end transitions */}
+      {history.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+                         textTransform: 'uppercase', color: theme.muted, marginBottom: 6 }}>
+            Previous rebalances
+          </div>
+          {history.map(r => (
+            <div key={r.month} style={{
+              display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap',
+              padding: '7px 0', borderTop: `1px solid ${theme.border}`,
+            }}>
+              <span style={{ fontSize: 11, fontWeight: 600, width: 56, flexShrink: 0,
+                              fontFamily: 'JetBrains Mono, monospace' }}>
+                {r.month}
+              </span>
+              <div style={{ ...chipWrap, flex: 1, minWidth: 220 }}>
+                {r.buys.map(t => <RebalanceChip key={`b-${t}`} ticker={t} kind="buy"
+                  group={r.meta?.[t]} theme={theme} showGroup={false} />)}
+                {r.sells.map(t => <RebalanceChip key={`s-${t}`} ticker={t} kind="sell"
+                  group={r.meta?.[t]} theme={theme} showGroup={false} />)}
+              </div>
+              <span style={{ fontSize: 10.5, color: theme.muted, flexShrink: 0,
+                              fontFamily: 'JetBrains Mono, monospace' }}>
+                {r.holds.length} kept
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // TopPerformersPanel — leaderboard of S&P 500 winners over a recent window
 // Self-contained: owns its own params + fetch state. Drop into a dashboard
 // with a `theme` and `accent` to restyle.
 // ============================================================
-function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500' }) {
+function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', cacheInfo, universes }) {
   const universeDefaultTopN = { sp500: 10, global_etfs: 5, us_sector_etfs: 3 };
   const [topN, setTopN] = useState(universeDefaultTopN[universe] || 10);
   const [days, setDays] = useState(30);
   const [data, setData] = useState(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
+  const runningRef = useRef(false);
 
-  // Reset state when the parent universe changes.
-  useEffect(() => {
-    setTopN(universeDefaultTopN[universe] || 10);
-    setData(null);
-    setError(null);
-  }, [universe]);
-
-  const onRefresh = async () => {
-    if (running) return;
+  const refresh = async (n, d) => {
+    if (runningRef.current) return;
+    runningRef.current = true;
     setRunning(true);
     setError(null);
     try {
-      const result = await fetchTopPerformers({ universe, topN, days });
+      const result = await fetchTopPerformers({ universe, topN: n, days: d });
       setData(result);
     } catch (e) {
       setError(e.message);
     } finally {
+      runningRef.current = false;
       setRunning(false);
     }
   };
+
+  // Reset state when the parent universe changes; reload right away if the
+  // price cache is warm (a cold cache would mean a surprise 30–60 s fetch).
+  const mounted = useRef(false);
+  useEffect(() => {
+    const n = universeDefaultTopN[universe] || 10;
+    setTopN(n);
+    setData(null);
+    setError(null);
+    if (mounted.current && cacheInfo) refresh(n, days);
+    mounted.current = true;
+  }, [universe]);
+
+  // Auto-load once on mount, as soon as we know the cache is warm.
+  const autoLoaded = useRef(false);
+  useEffect(() => {
+    if (cacheInfo && !autoLoaded.current) {
+      autoLoaded.current = true;
+      if (!data && !runningRef.current) refresh(topN, days);
+    }
+  }, [cacheInfo]);
+
+  const onRefresh = () => refresh(topN, days);
 
   const labelStyle = {
     fontSize: 10, fontWeight: 600, color: theme.muted,
@@ -684,19 +1035,18 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500' }) 
           </div>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-          <div>
-            <div style={labelStyle}>Top N</div>
-            <input type="number" value={topN} min={1} max={100}
-                   onChange={e => setTopN(+e.target.value || 10)}
-                   style={inputStyle} />
-          </div>
-          <div>
-            <div style={labelStyle}>Days</div>
-            <input type="number" value={days} min={1} max={365}
-                   onChange={e => setDays(+e.target.value || 30)}
-                   style={inputStyle} />
-          </div>
-          <button onClick={onRefresh} disabled={running}
+          <NumField id={`tp-topn-${universe}`} label="Top N" value={topN}
+                    min={1} max={maxTopNFor(universes, universe)}
+                    help={PARAM_HELP.topPerfN}
+                    onChange={setTopN}
+                    theme={theme} labelStyle={labelStyle} inputStyle={inputStyle} />
+          <NumField id={`tp-days-${universe}`} label="Days" value={days}
+                    min={1} max={365}
+                    help={PARAM_HELP.topPerfDays}
+                    onChange={setDays}
+                    theme={theme} labelStyle={labelStyle} inputStyle={inputStyle} />
+          <button onClick={onRefresh}
+                  disabled={running || !Number.isFinite(topN) || !Number.isFinite(days)}
                   style={{
                     padding: '7px 14px', fontSize: 12, fontWeight: 600,
                     background: running ? theme.muted : accent.dark, color: '#fff',
@@ -790,4 +1140,6 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500' }) 
 Object.assign(window, {
   EquityCurveChart, EventStudyChart, DrawdownChart, MonthlyHeatmap, Sparkline,
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
+  PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
+  RebalancePanel,
 });

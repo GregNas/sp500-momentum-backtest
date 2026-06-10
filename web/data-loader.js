@@ -1,22 +1,50 @@
 // Data loader: hits the FastAPI backend, exposes formatting helpers globally.
 // Replaces the design package's static data.js (which had synthetic numbers).
 
-async function runBacktest(params) {
-  const r = await fetch('/api/backtest', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(err.detail || 'Backtest failed');
+// Poll /api/progress/{runId} once a second, forwarding the latest server-side
+// status message ("Cache hit…", "Fetching 503 tickers…") to onProgress.
+function pollProgress(runId, onProgress) {
+  let seen = 0;
+  const timer = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/progress/${runId}`);
+      if (!r.ok) return;
+      const { messages } = await r.json();
+      if (messages.length > seen) {
+        seen = messages.length;
+        onProgress(messages[messages.length - 1]);
+      }
+    } catch (e) { /* polling is best-effort */ }
+  }, 1000);
+  return () => clearInterval(timer);
+}
+
+function newRunId() {
+  return (crypto.randomUUID && crypto.randomUUID()) || `run-${performance.now()}`;
+}
+
+async function runBacktest(params, onProgress) {
+  const runId = newRunId();
+  const stopPolling = onProgress ? pollProgress(runId, onProgress) : null;
+  try {
+    const r = await fetch('/api/backtest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...params, runId }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      throw new Error(err.detail || 'Backtest failed');
+    }
+    const body = await r.json();
+    // Convert ISO date strings into Date objects on the EQUITY.months axis
+    if (body.EQUITY && body.EQUITY.months) {
+      body.EQUITY.months = body.EQUITY.months.map(s => new Date(s));
+    }
+    return body;
+  } finally {
+    if (stopPolling) stopPolling();
   }
-  const body = await r.json();
-  // Convert ISO date strings into Date objects on the EQUITY.months axis
-  if (body.EQUITY && body.EQUITY.months) {
-    body.EQUITY.months = body.EQUITY.months.map(s => new Date(s));
-  }
-  return body;
 }
 
 async function fetchTopPerformers(params) {
@@ -34,6 +62,12 @@ async function fetchTopPerformers(params) {
 
 async function fetchCacheInfo() {
   const r = await fetch('/api/cache');
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+async function fetchUniverses() {
+  const r = await fetch('/api/universes');
   if (!r.ok) return null;
   return await r.json();
 }
@@ -62,8 +96,14 @@ function fmtNum(v, digits = 2) {
   if (v == null || isNaN(v)) return '—';
   return v.toFixed(digits);
 }
+function fmtAge(hours) {
+  if (hours == null || isNaN(hours)) return '—';
+  if (hours < 1) return '<1 h ago';
+  if (hours < 48) return `${Math.round(hours)} h ago`;
+  return `${Math.round(hours / 24)} d ago`;
+}
 
 Object.assign(window, {
-  runBacktest, fetchTopPerformers, fetchCacheInfo, clearCache,
-  fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtNum,
+  runBacktest, fetchTopPerformers, fetchCacheInfo, fetchUniverses, clearCache,
+  fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtNum, fmtAge,
 });

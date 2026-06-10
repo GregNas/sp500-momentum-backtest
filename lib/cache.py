@@ -103,15 +103,22 @@ def clear() -> None:
 
 
 def coverage() -> dict | None:
-    """Return current cache coverage (start, end, ticker count) or None if empty."""
+    """Return current cache coverage (start, end, ticker count, freshness) or None if empty."""
     meta = _load_meta()
     if meta is None:
         return None
-    return {
+    out = {
         "start": meta["start"],
         "end": meta["end"],
         "n_tickers": len(meta["tickers"]),
     }
+    fetched_at = meta.get("fetched_at")
+    if fetched_at:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(fetched_at)
+        out["fetched_at"] = fetched_at
+        out["age_hours"] = round(age.total_seconds() / 3600, 1)
+        out["is_fresh"] = age < timedelta(hours=TAIL_FRESH_HOURS)
+    return out
 
 
 def get_prices_cached(

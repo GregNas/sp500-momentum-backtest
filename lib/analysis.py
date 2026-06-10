@@ -142,6 +142,53 @@ def recent_picks(
     return out
 
 
+def rebalance_schedule(
+    monthly_returns: pd.DataFrame,
+    top_n: int,
+    rank_lookback: int,
+    n_months: int = 13,
+) -> list[dict]:
+    """Month-by-month trade list for a fully rebalanced top-N portfolio
+    (the 1-month-hold sleeve): what enters, what exits, what stays.
+
+    Unlike `recent_picks`, this includes the latest month-end — the cohort
+    without a realized forward return yet — because that row IS the
+    actionable trade list. Each entry, newest first:
+    {month: 'YYYY-MM', buys: [...], sells: [...], holds: [...]}.
+    """
+    if rank_lookback == 1:
+        ranking_signal = monthly_returns
+    else:
+        ranking_signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+
+    picks_cache: dict[int, list | None] = {}
+
+    def picks_at(i: int) -> list | None:
+        if i not in picks_cache:
+            ranking = ranking_signal.iloc[i].dropna()
+            picks_cache[i] = (
+                ranking.nlargest(top_n).index.tolist() if len(ranking) >= top_n else None
+            )
+        return picks_cache[i]
+
+    out: list[dict] = []
+    for i in range(len(monthly_returns) - 1, 0, -1):
+        if len(out) >= n_months:
+            break
+        curr, prev = picks_at(i), picks_at(i - 1)
+        if curr is None or prev is None:
+            continue
+        prev_set = set(prev)
+        curr_set = set(curr)
+        out.append({
+            "month": monthly_returns.index[i].strftime("%Y-%m"),
+            "buys": [t for t in curr if t not in prev_set],
+            "sells": [t for t in prev if t not in curr_set],
+            "holds": [t for t in curr if t in prev_set],
+        })
+    return out
+
+
 def top_performers_period(
     prices: pd.DataFrame,
     top_n: int = 10,

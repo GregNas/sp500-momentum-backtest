@@ -25,7 +25,9 @@ const v1StratColors = {
   h12m: '#0284c7',
 };
 
-function V1Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }) {
+function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cacheNotice,
+                     universes, compact, onClearCache }) {
+  const issues = paramIssues(params, universes);
   const cardStyle = {
     background: v1Theme.card,
     border: `1px solid ${v1Theme.border}`,
@@ -46,7 +48,7 @@ function V1Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
 
   return (
     <aside style={{
-      width: 260, padding: 20,
+      width: compact ? 210 : 260, flexShrink: 0, padding: compact ? 14 : 20,
       borderRight: `1px solid ${v1Theme.border}`,
       background: '#f5f5f4',
       display: 'flex', flexDirection: 'column', gap: 16,
@@ -67,22 +69,23 @@ function V1Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
           Parameters
         </div>
 
-        <div style={{ marginBottom: 12 }}>
-          <div style={labelStyle}>Lookback (years)</div>
-          <input type="number" value={params.lookback} min={1} max={25}
-                 onChange={e => setParam('lookback', +e.target.value)}
-                 style={inputBase} />
-        </div>
+        <NumField id="v1-lookback" label="Lookback (years)" value={params.lookback}
+                  min={1} max={25} help={PARAM_HELP.lookback}
+                  onChange={v => setParam('lookback', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
+
+        <NumField id="v1-topn" label="Top N picks / month" value={params.topN}
+                  min={1} max={maxTopNFor(universes, params.universe)} help={PARAM_HELP.topN}
+                  onChange={v => setParam('topN', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
 
         <div style={{ marginBottom: 12 }}>
-          <div style={labelStyle}>Top N picks / month</div>
-          <input type="number" value={params.topN} min={1} max={100}
-                 onChange={e => setParam('topN', +e.target.value)}
-                 style={inputBase} />
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <div style={labelStyle}>Hold periods (months)</div>
+          <div style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+            Hold periods (months)
+            <HelpTip help={PARAM_HELP.holds} theme={v1Theme} />
+          </div>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
             {[1, 2, 3, 6, 9, 12].map(h => {
               const on = params.holds.includes(h);
@@ -107,38 +110,46 @@ function V1Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
           </div>
         </div>
 
-        <div style={{ marginBottom: 12 }}>
-          <div style={labelStyle}>Rank lookback</div>
-          <input type="number" value={params.rankLookback} min={1} max={12}
-                 onChange={e => setParam('rankLookback', +e.target.value)}
-                 style={inputBase} />
-        </div>
+        <NumField id="v1-ranklb" label="Rank lookback" value={params.rankLookback}
+                  min={1} max={12} help={PARAM_HELP.rankLookback}
+                  onChange={v => setParam('rankLookback', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
 
-        <div style={{ marginBottom: 12 }}>
-          <div style={labelStyle}>Event horizon</div>
-          <input type="number" value={params.horizon} min={1} max={24}
-                 onChange={e => setParam('horizon', +e.target.value)}
-                 style={inputBase} />
-        </div>
+        <NumField id="v1-horizon" label="Event horizon" value={params.horizon}
+                  min={1} max={24} help={PARAM_HELP.horizon}
+                  onChange={v => setParam('horizon', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
 
         <div>
-          <div style={labelStyle}>Benchmark</div>
-          <input type="text" value={params.benchmark}
+          <label htmlFor="v1-benchmark"
+                 style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+            Benchmark
+            <HelpTip help={PARAM_HELP.benchmark} theme={v1Theme} />
+          </label>
+          <input id="v1-benchmark" type="text" value={params.benchmark}
                  onChange={e => setParam('benchmark', e.target.value.toUpperCase())}
                  style={inputBase} />
         </div>
       </div>
 
-      <button onClick={onRun} disabled={running}
+      <button onClick={onRun} disabled={running || issues.length > 0}
               style={{
                 padding: '10px 14px', fontSize: 13, fontWeight: 600,
-                background: running ? v1Theme.muted : v1Accent.dark, color: '#fff',
+                background: (running || issues.length) ? v1Theme.muted : v1Accent.dark,
+                color: '#fff',
                 border: 'none', borderRadius: 6,
-                cursor: running ? 'wait' : 'pointer',
+                cursor: running ? 'wait' : (issues.length ? 'not-allowed' : 'pointer'),
                 boxShadow: `0 1px 2px rgba(0,0,0,0.08)`,
               }}>
-        {running ? 'Running…' : 'Run backtest →'}
+        {running ? `Running… ${elapsed || 0}s` : 'Run backtest →'}
       </button>
+      {issues.length > 0 && !running && (
+        <div style={{ fontSize: 11, color: '#b91c1c', marginTop: -8 }}>
+          {issues[0]}
+        </div>
+      )}
 
       <div style={cardStyle}>
         <div style={{ fontSize: 12, fontWeight: 600, color: v1Theme.text, marginBottom: 8 }}>
@@ -146,15 +157,20 @@ function V1Sidebar({ params, setParam, onRun, running, cacheInfo, onClearCache }
         </div>
         <div style={{ fontSize: 11, color: v1Theme.muted, fontFamily: 'JetBrains Mono, monospace', lineHeight: 1.6 }}>
           {cacheInfo
-            ? <>Range  {cacheInfo.start} → {cacheInfo.end}<br/>Tickers  {cacheInfo.n_tickers}</>
+            ? <>Range  {cacheInfo.start} → {cacheInfo.end}<br/>Tickers  {cacheInfo.n_tickers}
+                {cacheInfo.age_hours != null && <><br/>Updated {fmtAge(cacheInfo.age_hours)} · {cacheInfo.is_fresh
+                  ? <span style={{ color: '#047857' }}>fresh</span>
+                  : <span title="Next run re-pulls the last 2 days">stale</span>}</>}
+              </>
             : <>Empty — first run will cold-fetch.</>}
         </div>
-        <button onClick={onClearCache} style={{
+        <button onClick={onClearCache} disabled={cacheNotice === 'Clearing…'} style={{
           marginTop: 10, width: '100%', padding: '6px 10px', fontSize: 11,
           background: '#fff', color: v1Theme.muted,
-          border: `1px solid ${v1Theme.border}`, borderRadius: 5, cursor: 'pointer',
+          border: `1px solid ${v1Theme.border}`, borderRadius: 5,
+          cursor: cacheNotice === 'Clearing…' ? 'wait' : 'pointer',
         }}>
-          Clear cache
+          {cacheNotice || 'Clear cache'}
         </button>
       </div>
     </aside>
@@ -165,7 +181,7 @@ function V1KpiTile({ label, value, sub, positive, mono = true }) {
   return (
     <div style={{
       background: v1Theme.card, border: `1px solid ${v1Theme.border}`,
-      borderRadius: 8, padding: '14px 16px', flex: 1, minWidth: 0,
+      borderRadius: 8, padding: '14px 16px', flex: '1 1 150px', minWidth: 150,
     }}>
       <div style={{ fontSize: 10, fontWeight: 500, color: v1Theme.muted,
                      letterSpacing: '0.06em', textTransform: 'uppercase' }}>
@@ -191,7 +207,7 @@ function V1KpiTile({ label, value, sub, positive, mono = true }) {
   );
 }
 
-function V1EmptyState({ onRun, running, error }) {
+function V1EmptyState({ onRun, running, error, elapsed, status }) {
   return (
     <div style={{
       flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -201,11 +217,17 @@ function V1EmptyState({ onRun, running, error }) {
         background: v1Theme.card, border: `1px solid ${v1Theme.border}`,
         borderRadius: 8, padding: 32, maxWidth: 480, textAlign: 'center',
       }}>
-        <div style={{ fontSize: 18, fontWeight: 600, color: v1Theme.text, marginBottom: 8 }}>
-          {error ? 'Backtest failed' : (running ? 'Running…' : 'No backtest yet')}
+        <div style={{ fontSize: 18, fontWeight: 600, color: v1Theme.text, marginBottom: 8,
+                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          {running && (
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: v1Accent.dark,
+                            animation: 'pulse 1.2s ease-in-out infinite' }} />
+          )}
+          {error ? 'Backtest failed' : (running ? `Running… ${elapsed || 0}s` : 'No backtest yet')}
         </div>
         <div style={{ fontSize: 13, color: v1Theme.muted, lineHeight: 1.6, marginBottom: 20 }}>
-          {error || 'Pick parameters in the sidebar, then run the backtest. First cold run pulls ~500 tickers from Yahoo (~60 s); subsequent runs hit the cache (sub-second).'}
+          {error || (running && status)
+            || 'Pick parameters in the sidebar, then run the backtest. First cold run pulls ~500 tickers from Yahoo (~60 s); subsequent runs hit the cache (sub-second).'}
         </div>
         {!running && (
           <button onClick={onRun} style={{
@@ -219,15 +241,20 @@ function V1EmptyState({ onRun, running, error }) {
   );
 }
 
-function V1Dashboard({ params, setParam, data, status, running, error,
-                       cacheInfo, onRun, onClearCache }) {
+function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
+                       cacheInfo, cacheNotice, universes, onRun, onClearCache }) {
   const [hoverIdx, setHoverIdx] = useStateV1(null);
+  const [pinnedIdx, setPinnedIdx] = useStateV1(null);
   const [logScale, setLogScale] = useStateV1(true);
   const [filled, setFilled] = useStateV1(false);
   const [chartTab, setChartTab] = useStateV1('equity');
+  const { isNarrow, isCompact } = useViewport();
 
-  // Reset hover when data changes (different month count)
-  useEffectV1(() => { setHoverIdx(null); }, [data]);
+  // Reset hover/pin when data changes (different month count)
+  useEffectV1(() => { setHoverIdx(null); setPinnedIdx(null); }, [data]);
+
+  // Hover takes precedence; a click pins a month for comparison.
+  const activeIdx = hoverIdx != null ? hoverIdx : pinnedIdx;
 
   const ready = data && data.PERF && data.EQUITY;
 
@@ -277,15 +304,19 @@ function V1Dashboard({ params, setParam, data, status, running, error,
       fontSize: 13, lineHeight: 1.5,
     }}>
       <V1Sidebar params={params} setParam={setParam}
-                 onRun={onRun} running={running}
-                 cacheInfo={cacheInfo} onClearCache={onClearCache} />
+                 onRun={onRun} running={running} elapsed={elapsed}
+                 cacheInfo={cacheInfo} cacheNotice={cacheNotice}
+                 universes={universes} compact={isCompact}
+                 onClearCache={onClearCache} />
 
       <main style={{ flex: 1, padding: 24, overflow: 'auto', display: 'flex',
                      flexDirection: 'column', gap: 16 }}>
-        <TopPerformersPanel theme={v1Theme} accent={v1Accent} />
+        <TopPerformersPanel theme={v1Theme} accent={v1Accent}
+                            cacheInfo={cacheInfo} universes={universes} />
 
         {!ready ? (
-          <V1EmptyState onRun={onRun} running={running} error={error} />
+          <V1EmptyState onRun={onRun} running={running} error={error}
+                        elapsed={elapsed} status={status} />
         ) : (
           <>
           {/* Header */}
@@ -299,7 +330,8 @@ function V1Dashboard({ params, setParam, data, status, running, error,
                 {monthRangeStr} · ranked on prior {params.rankLookback}m return · equal-weight
               </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11,
+            <div role="status" aria-live="polite"
+                 style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11,
                            color: v1Theme.muted }}>
               {status && (
                 <span style={{
@@ -308,7 +340,8 @@ function V1Dashboard({ params, setParam, data, status, running, error,
                   borderRadius: 12, fontWeight: 500,
                 }}>
                   <span style={{ width: 6, height: 6, borderRadius: '50%',
-                                  background: v1Accent.dark }} />
+                                  background: v1Accent.dark,
+                                  animation: running ? 'pulse 1.2s ease-in-out infinite' : 'none' }} />
                   {status}
                 </span>
               )}
@@ -317,7 +350,7 @@ function V1Dashboard({ params, setParam, data, status, running, error,
 
           {/* KPI row */}
           {bestStrat && spy && (
-            <div style={{ display: 'flex', gap: 16 }}>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
               <V1KpiTile
                 label="Best Sharpe"
                 value={fmtNum(bestStrat.Sharpe)}
@@ -402,8 +435,10 @@ function V1Dashboard({ params, setParam, data, status, running, error,
                     filled={filled}
                     theme={v1Theme}
                     accent={v1Accent}
-                    hoveredIdx={hoverIdx}
+                    hoveredIdx={activeIdx}
                     onHover={setHoverIdx}
+                    onSelect={i => setPinnedIdx(p => (p === i ? null : i))}
+                    ariaLabel={`Equity curves, ${equitySeries.length} series vs ${params.benchmark}, ${monthRangeStr}`}
                   />
                 </div>
                 <div style={{ display: 'flex', gap: 16, marginTop: 8, paddingLeft: 56,
@@ -416,12 +451,22 @@ function V1Dashboard({ params, setParam, data, status, running, error,
                         borderTop: s.dashed ? `1px dashed ${s.color}` : 'none',
                       }} />
                       <span style={{ color: v1Theme.text, fontWeight: 500 }}>{s.name}</span>
-                      <span>{fmtMult(hoverIdx != null ? s.values[hoverIdx] : s.values[s.values.length - 1])}</span>
+                      <span>{fmtMult(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
                     </div>
                   ))}
-                  {hoverIdx != null && months[hoverIdx] && (
-                    <div style={{ marginLeft: 'auto', color: v1Theme.text }}>
-                      {fmtMonthYear(months[hoverIdx])}
+                  {activeIdx != null && months[activeIdx] && (
+                    <div style={{ marginLeft: 'auto', color: v1Theme.text,
+                                   display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {fmtMonthYear(months[activeIdx])}
+                      {pinnedIdx != null && (
+                        <button onClick={() => setPinnedIdx(null)}
+                                aria-label="Clear pinned month"
+                                style={{ border: `1px solid ${v1Theme.border}`, background: '#fff',
+                                         color: v1Theme.muted, borderRadius: 4, cursor: 'pointer',
+                                         fontSize: 10, padding: '1px 5px', lineHeight: 1.4 }}>
+                          pinned ✕
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -431,18 +476,20 @@ function V1Dashboard({ params, setParam, data, status, running, error,
             {chartTab === 'drawdown' && bestKey && data.DRAWDOWN[bestKey] && (
               <div style={{ height: 220 }}>
                 <DrawdownChart series={data.DRAWDOWN[bestKey]} months={months}
-                               theme={v1Theme} accent={v1Accent} height={220} />
+                               theme={v1Theme} accent={v1Accent} height={220}
+                               label={bestStrat.strategy} />
               </div>
             )}
 
             {chartTab === 'heatmap' && bestKey && data.MONTHLY_RETURNS[bestKey] && (
               <MonthlyHeatmap returns={data.MONTHLY_RETURNS[bestKey]} months={months}
-                              theme={v1Theme} accent={v1Accent} />
+                              theme={v1Theme} accent={v1Accent} compact={isCompact} />
             )}
           </div>
 
           {/* Two-up: event study + perf table */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16 }}>
+          <div style={{ display: 'grid',
+                         gridTemplateColumns: isNarrow ? '1fr' : '1.4fr 1fr', gap: 16 }}>
             <div style={{
               background: v1Theme.card, border: `1px solid ${v1Theme.border}`,
               borderRadius: 8, padding: '14px 16px',
@@ -457,7 +504,8 @@ function V1Dashboard({ params, setParam, data, status, running, error,
                 </div>
                 <div style={{ fontSize: 11, color: v1Theme.muted,
                                fontFamily: 'JetBrains Mono, monospace' }}>
-                  <span style={{ color: v1Accent.dark, fontWeight: 600 }}>■</span> picks &nbsp;
+                  <span style={{ color: v1Accent.color, fontWeight: 600 }}>■</span> picks &nbsp;
+                  <span style={{ color: v1Accent.dark, fontWeight: 600 }}>■</span> significant (|t| ≥ 2) &nbsp;
                   <span style={{ color: v1Theme.benchmark }}>--</span> {params.benchmark} avg ({fmtPct(data.BENCHMARK_AVG_MONTHLY, 2, false)}/mo)
                 </div>
               </div>
@@ -537,12 +585,25 @@ function V1Dashboard({ params, setParam, data, status, running, error,
             </div>
           </div>
 
+          {/* Monthly rebalance trade list */}
+          <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}
+                          rankLookback={params.rankLookback}
+                          universe={params.universe || 'sp500'}
+                          theme={v1Theme} accent={v1Accent} />
+
           {/* Caveats */}
           <div style={{
             background: '#fef3c7', border: `1px solid #fcd34d`, borderRadius: 8,
             padding: '12px 16px', display: 'flex', gap: 12,
           }}>
-            <div style={{ fontSize: 16 }}>⚠</div>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"
+                 style={{ flexShrink: 0, marginTop: 2 }}>
+              <path d="M12 3.5 L22 20.5 H2 Z" stroke="#b45309" strokeWidth="2"
+                    strokeLinejoin="round" fill="none" />
+              <line x1="12" y1="10" x2="12" y2="14.5" stroke="#b45309" strokeWidth="2"
+                    strokeLinecap="round" />
+              <circle cx="12" cy="17.2" r="1.2" fill="#b45309" />
+            </svg>
             <div style={{ fontSize: 12, color: '#78350f', lineHeight: 1.6 }}>
               <span style={{ fontWeight: 600 }}>Read before trusting these numbers.</span>{' '}
               Survivorship bias — uses the <em>current</em> S&P 500 list, so failed names from earlier years are absent. Effect grows with longer lookbacks.

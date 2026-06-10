@@ -26,6 +26,11 @@ WEB_DIR = Path(__file__).parent / "web"
 
 app = FastAPI(title="S&P 500 Momentum Backtest")
 
+# In-flight status messages keyed by client-generated runId, polled via
+# GET /api/progress/{run_id}. In-process only — fine for single-worker uvicorn,
+# not shared across multiple workers.
+PROGRESS: dict[str, list[str]] = {}
+
 
 class BacktestParams(BaseModel):
     universe: UniverseKey = "sp500"
@@ -35,12 +40,14 @@ class BacktestParams(BaseModel):
     rankLookback: int = Field(1, ge=1, le=12)
     horizon: int = Field(12, ge=1, le=24)
     benchmark: str = "SPY"
+    runId: Optional[str] = None
 
 
 class TopPerformersParams(BaseModel):
     universe: UniverseKey = "sp500"
     topN: int = Field(10, ge=1, le=100)
     days: int = Field(30, ge=1, le=365)
+    runId: Optional[str] = None
 
 
 def _safe_floats(series: pd.Series) -> list:
@@ -56,12 +63,22 @@ def _drawdown(returns: pd.Series) -> list:
 
 @app.post("/api/backtest")
 def run_backtest(params: BacktestParams) -> dict:
+    try:
+        return _run_backtest(params)
+    finally:
+        if params.runId:
+            PROGRESS.pop(params.runId, None)
+
+
+def _run_backtest(params: BacktestParams) -> dict:
     if not params.holds:
         raise HTTPException(status_code=400, detail="At least one hold period is required.")
 
     status_messages: list[str] = []
     def on_status(msg: str) -> None:
         status_messages.append(msg)
+        if params.runId:
+            PROGRESS.setdefault(params.runId, []).append(msg)
 
     t_start = time.time()
     end = datetime.today()
@@ -216,6 +233,14 @@ def run_backtest(params: BacktestParams) -> dict:
             {"ticker": t, "group": sector_map.get(t, "")} for t in c["picks"]
         ]
 
+    # ---- Monthly rebalance trade list (1-month-hold sleeve) ----
+    rebalance = analysis.rebalance_schedule(
+        monthly, top_n=params.topN, rank_lookback=params.rankLookback, n_months=13,
+    )
+    for r in rebalance:
+        tickers_in_row = set(r["buys"]) | set(r["sells"]) | set(r["holds"])
+        r["meta"] = {t: sector_map.get(t, "") for t in tickers_in_row}
+
     return {
         "PERF": perf_rows,
         "EVENT_STUDY": event_study_rows,
@@ -225,6 +250,7 @@ def run_backtest(params: BacktestParams) -> dict:
         "ROLLING_SHARPE": rolling_sharpe_out,
         "COHORT_GROUPS": cohort_groups,
         "RECENT_COHORTS": cohorts,
+        "REBALANCE": rebalance,
         "BENCHMARK_AVG_MONTHLY": float(benchmark_monthly.mean()),
         "UNIVERSE_SIZE": int(constituents.shape[1]),
         "UNIVERSE_KEY": params.universe,
@@ -237,10 +263,20 @@ def run_backtest(params: BacktestParams) -> dict:
 
 @app.post("/api/top-performers")
 def top_performers(params: TopPerformersParams) -> dict:
+    try:
+        return _top_performers(params)
+    finally:
+        if params.runId:
+            PROGRESS.pop(params.runId, None)
+
+
+def _top_performers(params: TopPerformersParams) -> dict:
     """Top S&P 500 tickers by simple return over the last N calendar days."""
     status_messages: list[str] = []
     def on_status(msg: str) -> None:
         status_messages.append(msg)
+        if params.runId:
+            PROGRESS.setdefault(params.runId, []).append(msg)
 
     t_start = time.time()
     end = datetime.today()
@@ -307,6 +343,40 @@ def top_performers(params: TopPerformersParams) -> dict:
         "elapsed_s": round(time.time() - t_start, 2),
         "status_messages": status_messages,
     }
+
+
+@app.get("/api/progress/{run_id}")
+def progress(run_id: str) -> dict:
+    """Status messages collected so far for an in-flight run (polled by the UI)."""
+    return {"messages": PROGRESS.get(run_id, [])}
+
+
+@app.get("/api/universes")
+def universe_info() -> dict:
+    """Universe sizes + parameter ranges — single source of truth for client-side validation."""
+    out: dict = {
+        "ranges": {
+            "lookback": {"min": 1, "max": 25},
+            "topN": {"min": 1, "max": 100},
+            "rankLookback": {"min": 1, "max": 12},
+            "horizon": {"min": 1, "max": 24},
+        },
+        "universes": {},
+    }
+    for key in ("sp500", "global_etfs", "us_sector_etfs"):
+        try:
+            tickers, _ = data.get_universe(key)
+            size = len(tickers)
+        except Exception:
+            # Wikipedia hiccup on a cold ticker cache must never block UI validation.
+            size = None
+        out["universes"][key] = {
+            "label": universes.UNIVERSE_LABEL[key],
+            "size": size,
+            "max_topN": (size - 1) if size else None,
+            "default_benchmark": universes.DEFAULT_BENCHMARK.get(key, "SPY"),
+        }
+    return out
 
 
 @app.get("/api/cache")
