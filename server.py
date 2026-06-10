@@ -72,6 +72,8 @@ def run_backtest(params: BacktestParams) -> dict:
         universe_tickers, universe_meta = data.get_universe(params.universe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Universe fetch failed: {exc}")
 
     if params.topN >= len(universe_tickers):
         raise HTTPException(
@@ -249,6 +251,8 @@ def top_performers(params: TopPerformersParams) -> dict:
         tickers, meta = data.get_universe(params.universe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Universe fetch failed: {exc}")
 
     if params.topN >= len(tickers):
         raise HTTPException(

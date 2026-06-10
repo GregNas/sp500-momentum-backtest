@@ -80,15 +80,11 @@ See `PLAN.md` for the original design rationale.
   Use the **Clear cache** button in the sidebar to force a cold refresh.
 - **Frontend is React from CDN** (no build step). All JSX is transpiled in
   the browser by Babel-standalone — fine for a single-user local tool.
-- **macOS / corporate networks:** if your machine sits behind a TLS-inspection
-  proxy, the data layer auto-exports your macOS keychain CAs to
-  `cache/macos_ca_bundle.pem` on first run so Wikipedia and Yahoo requests
-  succeed. No manual setup required.
-- **Windows behind a corporate proxy:** the keychain auto-export is
-  macOS-only. If downloads fail with SSL errors, point
-  `REQUESTS_CA_BUNDLE` at your corporate CA bundle before running
-  (`set REQUESTS_CA_BUNDLE=C:\path\to\ca-bundle.pem`). On a home network
-  nothing is needed.
+- **Corporate networks (TLS-inspection proxies):** the data layer
+  auto-exports the OS trust store — macOS keychain or Windows certificate
+  store — to `cache/*_ca_bundle.pem` on first run so Wikipedia and Yahoo
+  requests succeed. No manual setup required. To override, set
+  `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` yourself before launching.
 
 ## Caveats (carried from the original script)
 
