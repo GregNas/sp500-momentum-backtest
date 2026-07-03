@@ -166,16 +166,17 @@ def get_prices_cached(
         full_end = max(requested[1], cached_end)
         fetches.append((missing_tickers, _d(full_start), _d(full_end)))
 
-    # 2. Range extends earlier
+    # 2. Range extends earlier (overlap into the cache so a basis shift is detectable)
     known_tickers = sorted(requested_set & cached_tickers)
     if requested[0] < cached_start and known_tickers:
-        fetches.append((known_tickers, _d(requested[0]), _d(cached_start - timedelta(days=1))))
+        fetches.append((known_tickers, _d(requested[0]),
+                        _d(cached_start + timedelta(days=SEAM_OVERLAP_DAYS))))
 
     # 3. Range extends later, OR tail refetch window — both skipped while cache is fresh
     if known_tickers and not cache_is_fresh:
         if requested[1] > cached_end:
             fetches.append((known_tickers,
-                            _d(cached_end + timedelta(days=1)), _d(requested[1])))
+                            _d(cached_end - timedelta(days=SEAM_OVERLAP_DAYS)), _d(requested[1])))
         else:
             tail_cutoff = cached_end - timedelta(days=TAIL_REFETCH_DAYS)
             if requested[1] > tail_cutoff:
@@ -187,10 +188,21 @@ def get_prices_cached(
         return _slice(cached, *requested, tickers)
 
     merged = cached
+    shifted: set[str] = set()
     for f_tickers, f_start, f_end in fetches:
         status(f"Fetching {len(f_tickers)} ticker(s), {f_start} to {f_end}")
         delta = fetcher(f_tickers, f_start, f_end)
+        shifted.update(_detect_basis_shifts(cached, delta))
         merged = _merge(merged, delta)
+
+    if shifted:
+        names = ", ".join(sorted(shifted))
+        status(f"Re-adjusted {len(shifted)} ticker(s) after detecting corporate "
+               f"actions: {names}")
+        full_start = min(requested[0], cached_start)
+        full_end = max(requested[1], cached_end)
+        fresh = fetcher(sorted(shifted), _d(full_start), _d(full_end))
+        merged = _merge(fresh, merged.drop(columns=list(shifted), errors="ignore"))
 
     _save(merged)
     return _slice(merged, *requested, tickers)
