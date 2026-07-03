@@ -25,6 +25,9 @@ SP500_META_JSON = CACHE_DIR / "sp500_meta.json"
 TICKERS_TTL_HOURS = 24
 TAIL_REFETCH_DAYS = 2     # how many days at the tail to re-pull when the cache is stale
 TAIL_FRESH_HOURS = 6      # skip the tail refetch when the cache was written this recently
+SEAM_OVERLAP_DAYS = 7     # calendar days of overlap requested at each stitch seam
+                          # (guarantees >= 3 trading days even across a holiday weekend)
+SEAM_SHIFT_TOL = 0.02     # flag a ticker when |median(delta/cached) - 1| exceeds this
 
 
 # ---------- tickers ----------
@@ -201,6 +204,35 @@ def _merge(base: pd.DataFrame, delta: pd.DataFrame) -> pd.DataFrame:
     """Combine two price frames; delta wins on overlapping (date, ticker) cells.
     Aligns on the union of indices and columns automatically."""
     return delta.combine_first(base).sort_index()
+
+
+def _detect_basis_shifts(base: pd.DataFrame, delta: pd.DataFrame,
+                         tol: float = SEAM_SHIFT_TOL) -> list[str]:
+    """Tickers whose adjustment basis differs between `base` (on-disk cache) and a
+    freshly-fetched `delta`.
+
+    Compares the two frames on the calendar days they share (the seam overlap).
+    Because the same day is fetched twice, the ratio isolates the adjustment-basis
+    change (a split / large-dividend re-base) and is immune to real market moves.
+    Tickers with no shared non-NaN day cannot be checked and are omitted.
+    """
+    common_tickers = [t for t in delta.columns if t in base.columns]
+    common_dates = base.index.intersection(delta.index)
+    if common_dates.empty or not common_tickers:
+        return []
+
+    b = base.loc[common_dates, common_tickers]
+    d = delta.loc[common_dates, common_tickers]
+    shifted: list[str] = []
+    for t in common_tickers:
+        pair = pd.concat([b[t], d[t]], axis=1).dropna()
+        pair = pair[pair.iloc[:, 0] != 0]
+        if pair.empty:
+            continue
+        ratio = (pair.iloc[:, 1] / pair.iloc[:, 0]).median()
+        if pd.notna(ratio) and abs(ratio - 1.0) > tol:
+            shifted.append(t)
+    return sorted(shifted)
 
 
 def _slice(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
