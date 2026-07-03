@@ -48,20 +48,63 @@ def event_study(
     return pd.DataFrame(rows)
 
 
+def _newey_west_tstat(x: np.ndarray, lag: int | None = None) -> float:
+    """t-statistic for H0: mean(x) == 0 using a Newey-West (HAC) standard error.
+
+    Event-study cohorts are formed every month and their top-N picks overlap
+    heavily from one month to the next, so the per-cohort series is
+    autocorrelated. The classic ``mean / (std / sqrt(n))`` t-stat assumes i.i.d.
+    observations and therefore overstates significance. A Bartlett-kernel
+    Newey-West SE corrects for that autocorrelation.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    n = len(x)
+    if n < 2:
+        return np.nan
+    mean = x.mean()
+    e = x - mean
+    if lag is None:
+        # Standard automatic bandwidth (Newey-West 1994 plug-in rule).
+        lag = int(np.floor(4 * (n / 100.0) ** (2.0 / 9.0)))
+    lag = max(0, min(lag, n - 1))
+    gamma0 = np.dot(e, e) / n
+    var = gamma0
+    for k in range(1, lag + 1):
+        weight = 1.0 - k / (lag + 1.0)          # Bartlett kernel
+        cov = np.dot(e[k:], e[:-k]) / n
+        var += 2.0 * weight * cov
+    if var <= 0:
+        return np.nan
+    se_mean = np.sqrt(var / n)
+    return mean / se_mean if se_mean > 0 else np.nan
+
+
 def event_study_summary(events: pd.DataFrame, benchmark_monthly: pd.Series) -> pd.DataFrame:
-    """Aggregate event study by horizon, with benchmark comparison."""
-    g = events.groupby("h")
-    summary = pd.DataFrame({
-        "avg_return":      g["mean_return"].mean(),
-        "median_return":   g["mean_return"].median(),
-        "win_rate":        g["mean_return"].apply(lambda s: (s > 0).mean()),
-        "std":             g["mean_return"].std(),
-        "n_cohorts":       g["mean_return"].count(),
-    })
+    """Aggregate event study by horizon, with benchmark comparison.
+
+    The ``t_stat`` column tests alpha (avg cohort return minus the benchmark
+    monthly mean) with a Newey-West HAC standard error, so overlapping cohorts
+    don't inflate significance. See :func:`_newey_west_tstat`.
+    """
     bench_mean = benchmark_monthly.mean()
-    summary["benchmark_avg"] = bench_mean
-    summary["alpha_vs_bench"] = summary["avg_return"] - bench_mean
-    summary["t_stat"] = summary["alpha_vs_bench"] / (summary["std"] / np.sqrt(summary["n_cohorts"]))
+    rows: dict[int, dict] = {}
+    for h, grp in events.groupby("h"):
+        s = grp["mean_return"]
+        rows[int(h)] = {
+            "avg_return":     s.mean(),
+            "median_return":  s.median(),
+            "win_rate":       (s > 0).mean(),
+            "std":            s.std(),
+            "n_cohorts":      int(s.count()),
+            "benchmark_avg":  bench_mean,
+            "alpha_vs_bench": s.mean() - bench_mean,
+            "t_stat":         _newey_west_tstat((s - bench_mean).values),
+        }
+    cols = ["avg_return", "median_return", "win_rate", "std", "n_cohorts",
+            "benchmark_avg", "alpha_vs_bench", "t_stat"]
+    summary = pd.DataFrame.from_dict(rows, orient="index", columns=cols).sort_index()
+    summary.index.name = "h"
     return summary
 
 
@@ -238,12 +281,17 @@ def rolling_sharpe(
     returns: pd.Series,
     window: int = 12,
     periods_per_year: int = 12,
+    risk_free_annual: float = 0.0,
 ) -> pd.Series:
-    """Rolling annualized Sharpe ratio over a trailing window."""
+    """Rolling annualized Sharpe ratio over a trailing window.
+
+    Same definition as `perf_stats`: annualized arithmetic mean excess return
+    over annualized volatility.
+    """
     r = returns.astype(float)
     mean = r.rolling(window).mean() * periods_per_year
     vol = r.rolling(window).std() * np.sqrt(periods_per_year)
-    return (mean / vol).replace([np.inf, -np.inf], np.nan)
+    return ((mean - risk_free_annual) / vol).replace([np.inf, -np.inf], np.nan)
 
 
 def cohort_sector_breakdown(
@@ -281,14 +329,26 @@ def cohort_sector_breakdown(
     return out
 
 
-def perf_stats(returns: pd.Series, periods_per_year: int = 12) -> dict:
-    """Standard performance stats for a return series."""
+def perf_stats(
+    returns: pd.Series,
+    periods_per_year: int = 12,
+    risk_free_annual: float = 0.0,
+) -> dict:
+    """Standard performance stats for a return series.
+
+    Sharpe follows the textbook definition: annualized *arithmetic* mean excess
+    return over annualized volatility, with an explicit annual risk-free rate
+    (default 0). This matches `rolling_sharpe`; earlier versions divided CAGR by
+    vol, which mixed a geometric numerator with an arithmetic denominator and
+    silently assumed a zero risk-free rate.
+    """
     r = returns.dropna()
     cum = (1 + r).prod() - 1
     years = len(r) / periods_per_year
     cagr = (1 + cum) ** (1 / years) - 1 if years > 0 else 0
+    ann_mean = r.mean() * periods_per_year
     vol = r.std() * np.sqrt(periods_per_year)
-    sharpe = cagr / vol if vol > 0 else 0
+    sharpe = (ann_mean - risk_free_annual) / vol if vol > 0 else 0
     equity = (1 + r).cumprod()
     drawdown = (equity / equity.cummax() - 1).min()
     return {
@@ -299,3 +359,26 @@ def perf_stats(returns: pd.Series, periods_per_year: int = 12) -> dict:
         "max_drawdown": drawdown,
         "months": len(r),
     }
+
+
+def calendar_year_returns(returns: pd.Series) -> list[dict]:
+    """Compound a monthly return series within each calendar year.
+
+    Returns an oldest-first list of
+    ``{year, return_pct, months, partial}``. ``partial`` is True when the year
+    has fewer than 12 monthly observations (a truncated first year or the
+    current year-to-date), so the UI can label it.
+    """
+    r = returns.dropna()
+    if r.empty:
+        return []
+    out: list[dict] = []
+    for year, grp in r.groupby(r.index.year):
+        comp = float((1 + grp).prod() - 1)
+        out.append({
+            "year": int(year),
+            "return_pct": comp,
+            "months": int(len(grp)),
+            "partial": bool(len(grp) < 12),
+        })
+    return out

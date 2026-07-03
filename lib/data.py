@@ -189,6 +189,11 @@ def get_universe(name: str) -> tuple[list[str], dict[str, dict]]:
 
 
 def to_monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Daily prices -> monthly returns (last close of each month)."""
+    """Daily prices -> monthly returns (last close of each month).
+
+    ``fill_method=None`` so a month with no price stays NaN instead of being
+    forward-filled to a fake 0% return (which would keep a delisted/halted name
+    eligible for ranking on a stale price).
+    """
     monthly = prices.resample("ME").last()
-    return monthly.pct_change().dropna(how="all")
+    return monthly.pct_change(fill_method=None).dropna(how="all")

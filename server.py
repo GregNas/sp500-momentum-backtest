@@ -40,6 +40,7 @@ class BacktestParams(BaseModel):
     rankLookback: int = Field(1, ge=1, le=12)
     horizon: int = Field(12, ge=1, le=24)
     benchmark: str = "SPY"
+    riskFree: float = Field(0.0, ge=0.0, le=0.2)  # annual risk-free rate for Sharpe
     runId: Optional[str] = None
 
 
@@ -120,7 +121,7 @@ def _run_backtest(params: BacktestParams) -> dict:
     benchmark_prices = prices[params.benchmark]
     constituents = prices.drop(columns=[params.benchmark])
     monthly = data.to_monthly_returns(constituents)
-    benchmark_monthly = benchmark_prices.resample("ME").last().pct_change().dropna()
+    benchmark_monthly = benchmark_prices.resample("ME").last().pct_change(fill_method=None).dropna()
 
     # Coverage status: how many tickers have a full-window history?
     if len(constituents.columns):
@@ -156,9 +157,17 @@ def _run_backtest(params: BacktestParams) -> dict:
             detail="Backtest produced no data. Try a longer lookback or fewer rank_lookback months.",
         )
 
-    # Align benchmark to strategy index
+    # Align benchmark to strategy index. Don't silently fabricate 0% months —
+    # if the benchmark genuinely lacks a month the strategy has, surface it.
     first_returns = next(iter(strategy_returns.values()))
-    bench_aligned = benchmark_monthly.reindex(first_returns.index).fillna(0)
+    bench_aligned = benchmark_monthly.reindex(first_returns.index)
+    n_missing = int(bench_aligned.isna().sum())
+    if n_missing:
+        on_status(
+            f"Benchmark {params.benchmark}: {n_missing} month(s) missing in the "
+            f"strategy window — treated as flat (0%) for alignment."
+        )
+    bench_aligned = bench_aligned.fillna(0.0)
 
     # ---- Build response ----
     months_iso = [d.strftime("%Y-%m-%d") for d in first_returns.index]
@@ -179,13 +188,13 @@ def _run_backtest(params: BacktestParams) -> dict:
 
     perf_rows = []
     for h, r in strategy_returns.items():
-        s = analysis.perf_stats(r)
+        s = analysis.perf_stats(r, risk_free_annual=params.riskFree)
         perf_rows.append({
             "strategy": f"top{params.topN}_hold{h}m",
             **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
                for k, v in s.items()},
         })
-    bench_stats = analysis.perf_stats(bench_aligned)
+    bench_stats = analysis.perf_stats(bench_aligned, risk_free_annual=params.riskFree)
     perf_rows.append({
         "strategy": params.benchmark,
         **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
@@ -211,10 +220,12 @@ def _run_backtest(params: BacktestParams) -> dict:
     # ---- Rolling Sharpe (12m) for each strategy + benchmark ----
     rolling_sharpe_out: dict = {"months": months_iso}
     for h, r in strategy_returns.items():
-        rs = analysis.rolling_sharpe(r.reindex(first_returns.index)).fillna(0)
+        rs = analysis.rolling_sharpe(
+            r.reindex(first_returns.index), risk_free_annual=params.riskFree
+        ).fillna(0)
         rolling_sharpe_out[f"h{h}m"] = _safe_floats(rs)
     rolling_sharpe_out["spy"] = _safe_floats(
-        analysis.rolling_sharpe(bench_aligned).fillna(0)
+        analysis.rolling_sharpe(bench_aligned, risk_free_annual=params.riskFree).fillna(0)
     )
 
     # ---- Cohort group breakdown (sector or country/region per universe) ----
@@ -241,12 +252,19 @@ def _run_backtest(params: BacktestParams) -> dict:
         tickers_in_row = set(r["buys"]) | set(r["sells"]) | set(r["holds"])
         r["meta"] = {t: sector_map.get(t, "") for t in tickers_in_row}
 
+    # ---- Calendar-year (year-over-year) returns per strategy + benchmark ----
+    yearly_returns_out: dict = {}
+    for h, r in strategy_returns.items():
+        yearly_returns_out[f"h{h}m"] = analysis.calendar_year_returns(r)
+    yearly_returns_out["spy"] = analysis.calendar_year_returns(bench_aligned)
+
     return {
         "PERF": perf_rows,
         "EVENT_STUDY": event_study_rows,
         "EQUITY": equity,
         "DRAWDOWN": drawdown,
         "MONTHLY_RETURNS": monthly_returns_out,
+        "YEARLY_RETURNS": yearly_returns_out,
         "ROLLING_SHARPE": rolling_sharpe_out,
         "COHORT_GROUPS": cohort_groups,
         "RECENT_COHORTS": cohorts,
@@ -370,10 +388,14 @@ def universe_info() -> dict:
         except Exception:
             # Wikipedia hiccup on a cold ticker cache must never block UI validation.
             size = None
+        # Cap at both the universe size (server rejects topN >= size) and the
+        # hard parameter limit the /api/backtest endpoint enforces (topN <= 100),
+        # so the advertised ceiling matches what will actually be accepted.
+        topn_hard_max = out["ranges"]["topN"]["max"]
         out["universes"][key] = {
             "label": universes.UNIVERSE_LABEL[key],
             "size": size,
-            "max_topN": (size - 1) if size else None,
+            "max_topN": (min(size - 1, topn_hard_max) if size else None),
             "default_benchmark": universes.DEFAULT_BENCHMARK.get(key, "SPY"),
         }
     return out
@@ -392,9 +414,20 @@ def clear_cache() -> dict:
 
 # ---- static frontend ----
 
+# The frontend has no build step (JSX is transpiled in-browser), so files change
+# in place. Tell the browser to always revalidate via ETag — it gets fresh code
+# the moment a file changes and a cheap 304 otherwise, instead of silently
+# serving a stale cached copy after an edit.
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 @app.get("/")
 def root() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-app.mount("/", StaticFiles(directory=WEB_DIR), name="web")
+app.mount("/", NoCacheStaticFiles(directory=WEB_DIR), name="web")

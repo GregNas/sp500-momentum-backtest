@@ -153,6 +153,12 @@ function V2Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                style={inputBase} />
       </div>
 
+      <NumField id="v2-riskfree" label="Risk-free (annual %)"
+                value={+(((params.riskFree || 0) * 100).toFixed(2))}
+                min={0} max={20} help={PARAM_HELP.riskFree}
+                onChange={v => setParam('riskFree', Number.isFinite(v) ? v / 100 : 0)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+
       <button onClick={onRun} disabled={running || issues.length > 0}
               style={{
                 padding: '8px 12px', fontSize: 12, fontWeight: 600,
@@ -455,7 +461,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                   <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <span style={{ width: 10, height: 2, background: s.color }} />
                     <span style={{ color: v2Theme.text, fontWeight: 500 }}>{s.name}</span>
-                    <span>{fmtMult(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
+                    <span>{fmtGrowthPct(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
                   </div>
                 ))}
                 {activeIdx != null && months[activeIdx] && (
@@ -497,7 +503,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                   </div>
                   <div style={{ fontSize: 11, opacity: 0.85, marginTop: 4, lineHeight: 1.6 }}>
                     Sharpe <strong style={{ fontFamily: 'JetBrains Mono, monospace' }}>{fmtNum(bestStrat.Sharpe)}</strong>
-                    {' '}· {fmtMult(bestStrat.total_return)} return
+                    {' '}· {fmtPct(bestStrat.total_return, 0)} return
                     {' '}· {fmtPct(bestStrat.CAGR, 1, false)} CAGR
                   </div>
                 </div>
@@ -691,6 +697,11 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
               </div>
             </div>
           </div>
+
+          {/* Year-over-year + monthly earnings tables */}
+          <EarningsBreakdown data={data} params={params} bestKey={bestKey}
+                             theme={v2Theme} accent={v2Accent}
+                             headingFont='"Source Serif Pro", Georgia, serif' />
 
           {/* Monthly rebalance trade list */}
           <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}

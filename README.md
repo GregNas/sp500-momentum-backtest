@@ -31,7 +31,12 @@ addressable via `#v1` / `#v2` URL hash):
 - **V1 · Stripe-calm** — cards + KPI tiles, tabbed equity / drawdown / monthly-returns chart, event study + perf table.
 - **V2 · Editorial** — serif headline, equity + drawdown stacked, side rail (best sleeve / vs benchmark / all sleeves), recent-picks panel with real S&P 500 names, monthly heatmap.
 
-Both share state and the same backend.
+Both share state and the same backend. Returns are shown as **percentages**
+(total, per-calendar-year, per-month) rather than growth multiples, and both
+dashboards include an **Earnings breakdown** panel: a year-by-year %-return
+table (strategy vs benchmark) and a month-by-month earnings table (monthly
+return, running cumulative, benchmark, and outperformance), with a sleeve
+selector.
 
 ```bash
 .venv/bin/uvicorn server:app --port 8000          # macOS / Linux
@@ -78,6 +83,11 @@ See `PLAN.md` for the original design rationale.
 - **Cache freshness:** within 6 h of a fetch, the cache is taken as-is.
   After 6 h, the trailing 2 days are re-pulled to catch late-posted bars.
   Use the **Clear cache** button in the sidebar to force a cold refresh.
+- **Split-safe caching:** `auto_adjust` rebases each fetch's whole history to
+  its end date, so naively stitching an older cached segment onto a fresh delta
+  across a stock split leaves a spurious price jump. The cache detects that jump
+  at the stitch seam and re-fetches the affected tickers' full history on one
+  consistent basis (`cache.repair()` heals an already-corrupted cache).
 - **Frontend is React from CDN** (no build step). All JSX is transpiled in
   the browser by Babel-standalone — fine for a single-user local tool.
 - **Corporate networks (TLS-inspection proxies):** the data layer
@@ -94,3 +104,13 @@ See `PLAN.md` for the original design rationale.
   start the next month.
 - Ignores transaction costs, taxes, slippage. Equal weight, no risk
   constraints.
+
+## Methodology notes
+
+- **Sharpe** is the textbook ratio: annualized *arithmetic* mean excess return
+  over annualized volatility, with an explicit annual risk-free rate (`riskFree`,
+  default 0). Headline and rolling Sharpe use the same definition.
+- **Event-study t-stats** use Newey-West (HAC) standard errors, so the
+  overlapping monthly cohorts don't inflate significance.
+- Reported strategy returns are in-sample, cost-free and concentration-heavy —
+  treat them as an upper bound, not an achievable forward expectation.

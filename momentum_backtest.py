@@ -72,7 +72,7 @@ def main():
     constituents = prices.drop(columns=[BENCHMARK])
 
     monthly = data.to_monthly_returns(constituents)
-    benchmark_monthly = benchmark_prices.resample("ME").last().pct_change().dropna()
+    benchmark_monthly = benchmark_prices.resample("ME").last().pct_change(fill_method=None).dropna()
 
     # ---- 1. Event study ----
     print("\n--- EVENT STUDY ---")

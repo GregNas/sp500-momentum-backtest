@@ -92,6 +92,17 @@ function fmtMult(v) {
   if (v == null || isNaN(v)) return '—';
   return `${v.toFixed(2)}×`;
 }
+// Growth-of-$1 multiple (e.g. 5.79) rendered as a cumulative % return (+479%).
+function fmtGrowthPct(mult, digits = 0) {
+  if (mult == null || isNaN(mult)) return '—';
+  return fmtPct(mult - 1, digits);
+}
+// Compact equity-axis tick label: multiple 1 -> "0%", 5 -> "+400%".
+function fmtEquityAxis(mult) {
+  if (mult == null || isNaN(mult)) return '';
+  const r = Math.round((mult - 1) * 100);
+  return `${r > 0 ? '+' : ''}${r}%`;
+}
 function fmtNum(v, digits = 2) {
   if (v == null || isNaN(v)) return '—';
   return v.toFixed(digits);
@@ -105,5 +116,6 @@ function fmtAge(hours) {
 
 Object.assign(window, {
   runBacktest, fetchTopPerformers, fetchCacheInfo, fetchUniverses, clearCache,
-  fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtNum, fmtAge,
+  fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtGrowthPct, fmtEquityAxis,
+  fmtNum, fmtAge,
 });

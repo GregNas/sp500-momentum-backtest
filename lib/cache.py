@@ -26,6 +26,16 @@ TICKERS_TTL_HOURS = 24
 TAIL_REFETCH_DAYS = 2     # how many days at the tail to re-pull when the cache is stale
 TAIL_FRESH_HOURS = 6      # skip the tail refetch when the cache was written this recently
 
+# Split / adjustment-basis discontinuity detection.
+# yfinance auto_adjust rebases the WHOLE adjusted-close history to each fetch's
+# end date. When a freshly-fetched delta is stitched onto an older cached
+# segment across a stock split, the two segments sit on different bases and
+# leave a spurious overnight jump. A real one-day move for an index constituent
+# essentially never crosses these bounds, but split ratios do (2:1 -> 0.5,
+# 3:2 -> 0.67, 1:3 reverse -> ~3.0).
+SPLIT_JUMP_HI = 1.40
+SPLIT_JUMP_LO = 0.72
+
 
 # ---------- tickers ----------
 
@@ -189,6 +199,24 @@ def get_prices_cached(
         delta = fetcher(f_tickers, f_start, f_end)
         merged = _merge(merged, delta)
 
+    # Only known tickers (present in both the old cache and this run) can carry a
+    # stitch across their old/new adjustment basis; a split in the fetched gap
+    # shows up as a jump at the seam between cached and freshly-pulled data.
+    # Boundary = last old-basis date on one side, first fresh-basis date on the
+    # other. Extend-earlier prepends fresh bars *before* cached_start, so its
+    # seam sits just below cached_start; extend-later / tail append fresh bars
+    # after an old-basis date.
+    boundaries = set()
+    if requested[0] < cached_start:
+        boundaries.add(cached_start - timedelta(days=1))
+    if not cache_is_fresh:
+        boundaries.add(cached_end if requested[1] > cached_end
+                       else cached_end - timedelta(days=TAIL_REFETCH_DAYS))
+    merged = _heal_split_artifacts(
+        merged, sorted(requested_set & cached_tickers), fetcher, status,
+        boundaries=boundaries,
+    )
+
     _save(merged)
     return _slice(merged, *requested, tickers)
 
@@ -208,3 +236,103 @@ def _slice(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
     cols = [t for t in tickers if t in prices.columns]
     sliced = prices.loc[start:end, cols].dropna(axis=1, how="all")
     return sliced
+
+
+# ---------- split / adjustment-basis healing ----------
+
+def _is_split_ratio(r: float) -> bool:
+    return r > SPLIT_JUMP_HI or r < SPLIT_JUMP_LO
+
+
+def _detect_split_artifacts(prices: pd.DataFrame, tickers, boundaries=None) -> list[str]:
+    """Tickers whose series has a jump characteristic of a split /
+    adjustment-basis mismatch rather than a normal daily move.
+
+    ``boundaries`` (a set of stitch-boundary Timestamps) restricts the check to
+    the price step *across* those dates — used by the routine delta path, where
+    only a jump at the old/new-basis seam signals an artifact. When omitted the
+    whole series is scanned (used by the one-off :func:`repair`).
+    """
+    flagged: list[str] = []
+    for tk in tickers:
+        if tk not in prices.columns:
+            continue
+        s = prices[tk].dropna()
+        if len(s) < 2:
+            continue
+        if boundaries:
+            hit = False
+            for b in boundaries:
+                before = s[s.index <= b]
+                after = s[s.index > b]
+                if before.empty or after.empty:
+                    continue
+                if _is_split_ratio(after.iloc[0] / before.iloc[-1]):
+                    hit = True
+                    break
+            if hit:
+                flagged.append(tk)
+        else:
+            ratio = (s / s.shift(1)).iloc[1:]
+            if _is_split_ratio(ratio.max()) or _is_split_ratio(ratio.min()):
+                flagged.append(tk)
+    return flagged
+
+
+def _heal_split_artifacts(
+    merged: pd.DataFrame,
+    suspects,
+    fetcher: Callable[[list[str], str, str], pd.DataFrame],
+    status: Callable[[str], None] | None = None,
+    boundaries=None,
+) -> pd.DataFrame:
+    """Re-fetch full histories for any suspect ticker that shows a split-basis
+    discontinuity, so its whole series shares one adjustment basis.
+
+    Best-effort: on a re-fetch failure the (imperfect) stitched data is kept.
+    """
+    def _status(msg: str) -> None:
+        if status is not None:
+            status(msg)
+
+    flagged = _detect_split_artifacts(merged, suspects, boundaries)
+    if not flagged:
+        return merged
+
+    _status(
+        f"Healing {len(flagged)} split-adjusted ticker(s) via full re-fetch: "
+        f"{', '.join(flagged[:8])}" + ("…" if len(flagged) > 8 else "")
+    )
+    full_start = _d(merged.index.min())
+    full_end = _d(merged.index.max() + timedelta(days=1))
+    try:
+        clean = fetcher(flagged, full_start, full_end)
+    except Exception as exc:  # network is best-effort; keep stitched data
+        _status(f"Split-heal re-fetch failed ({exc}); serving stitched data")
+        return merged
+
+    for tk in flagged:
+        if tk in clean.columns:
+            # Prefer fresh (consistent-basis) values, but fall back to the
+            # existing cached values for any date the re-fetch didn't return —
+            # a partial/short response must never blank out valid prices.
+            merged[tk] = clean[tk].reindex(merged.index).combine_first(merged[tk])
+    return merged
+
+
+def repair(
+    fetcher: Callable[[list[str], str, str], pd.DataFrame],
+    status: Callable[[str], None] | None = None,
+) -> list[str]:
+    """One-off cache repair: scan the on-disk parquet for split-artifact
+    discontinuities left by earlier delta stitches and re-fetch the affected
+    tickers on one consistent basis. Returns the list of healed tickers."""
+    if _load_meta() is None:
+        return []
+    merged = pd.read_parquet(PRICES_PARQUET)
+    flagged = _detect_split_artifacts(merged, list(merged.columns))
+    if not flagged:
+        return []
+    merged = _heal_split_artifacts(merged, flagged, fetcher, status)
+    _save(merged)
+    return flagged

@@ -132,6 +132,13 @@ function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                  onChange={e => setParam('benchmark', e.target.value.toUpperCase())}
                  style={inputBase} />
         </div>
+
+        <NumField id="v1-riskfree" label="Risk-free (annual %)"
+                  value={+(((params.riskFree || 0) * 100).toFixed(2))}
+                  min={0} max={20} help={PARAM_HELP.riskFree}
+                  onChange={v => setParam('riskFree', Number.isFinite(v) ? v / 100 : 0)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginTop: 12 }} />
       </div>
 
       <button onClick={onRun} disabled={running || issues.length > 0}
@@ -358,8 +365,8 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
               />
               <V1KpiTile
                 label="Total return"
-                value={fmtMult(bestStrat.total_return)}
-                sub={`${params.benchmark} ${fmtMult(spy.total_return)} · Δ +${((bestStrat.total_return - spy.total_return) * 100).toFixed(0)}pp`}
+                value={fmtPct(bestStrat.total_return, 0)}
+                sub={`${params.benchmark} ${fmtPct(spy.total_return, 0)} · Δ +${((bestStrat.total_return - spy.total_return) * 100).toFixed(0)}pp`}
                 positive={bestStrat.total_return >= spy.total_return}
               />
               <V1KpiTile
@@ -451,7 +458,7 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                         borderTop: s.dashed ? `1px dashed ${s.color}` : 'none',
                       }} />
                       <span style={{ color: v1Theme.text, fontWeight: 500 }}>{s.name}</span>
-                      <span>{fmtMult(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
+                      <span>{fmtGrowthPct(activeIdx != null ? s.values[activeIdx] : s.values[s.values.length - 1])}</span>
                     </div>
                   ))}
                   {activeIdx != null && months[activeIdx] && (
@@ -571,7 +578,7 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                           {isBest && <span style={{ color: v1Accent.dark, marginRight: 4 }}>●</span>}
                           {p.strategy}
                         </td>
-                        <td style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtMult(p.total_return)}</td>
+                        <td style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtPct(p.total_return, 0)}</td>
                         <td style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtPct(p.CAGR, 1, false)}</td>
                         <td style={{ padding: '7px 4px', textAlign: 'right',
                                       fontWeight: isBest ? 600 : 400 }}>{fmtNum(p.Sharpe)}</td>
@@ -584,6 +591,10 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
               </table>
             </div>
           </div>
+
+          {/* Year-over-year + monthly earnings tables */}
+          <EarningsBreakdown data={data} params={params} bestKey={bestKey}
+                             theme={v1Theme} accent={v1Accent} />
 
           {/* Monthly rebalance trade list */}
           <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}

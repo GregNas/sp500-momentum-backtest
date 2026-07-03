@@ -99,7 +99,7 @@ function EquityCurveChart({
                 stroke={theme.grid} strokeWidth="1" strokeDasharray="2 4" />
           <text x={padL - 8} y={yAt(t) + 4} textAnchor="end"
                 fontSize="11" fill={theme.axis} fontFamily="JetBrains Mono, monospace">
-            {logScale ? `${t}×` : t.toFixed(1)}
+            {fmtEquityAxis(t)}
           </text>
         </g>
       ))}
@@ -684,6 +684,7 @@ const PARAM_HELP = {
   rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
   horizon: 'How many months forward the event study tracks each cohort after selection.',
   benchmark: 'Ticker the strategy is measured against.',
+  riskFree: 'Annual risk-free rate (%) subtracted from returns when computing the Sharpe ratio.',
   topPerfN: 'How many tickers to show in the leaderboard.',
   topPerfDays: 'Calendar-day window the return is measured over.',
 };
@@ -1137,9 +1138,199 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
   );
 }
 
+// ============================================================
+// EarningsBreakdown — year-over-year (%) table + month-by-month earnings
+// table, with a sleeve selector. Shared by V1/V2. Percentages throughout
+// (no ×-multiples). Reads YEARLY_RETURNS + MONTHLY_RETURNS from the API.
+// ============================================================
+function EarningsBreakdown({ data, params, bestKey, theme, accent, headingFont }) {
+  const { isNarrow } = useViewport();
+  const holdKeys = (params.holds || [])
+    .map(h => `h${h}m`)
+    .filter(k => data.MONTHLY_RETURNS && data.MONTHLY_RETURNS[k]);
+  const [selKey, setSelKey] = useState(null);
+  if (!holdKeys.length || !data.MONTHLY_RETURNS) return null;
+  const effKey = (selKey && holdKeys.includes(selKey)) ? selKey
+               : (holdKeys.includes(bestKey) ? bestKey : holdKeys[0]);
+
+  const green = '#047857', red = '#b91c1c';
+  const colorOf = (v) => (v == null || isNaN(v) ? theme.muted : (v >= 0 ? green : red));
+  const benchLabel = params.benchmark || 'SPY';
+  const stratLabel = `top${params.topN}_${effKey}`;
+
+  const months = (data.EQUITY.months || []).map(s => new Date(s));
+  const stratRet = data.MONTHLY_RETURNS[effKey] || [];
+  const benchRet = data.MONTHLY_RETURNS.spy || [];
+  const yearly = data.YEARLY_RETURNS || {};
+  const stratYears = yearly[effKey] || [];
+  const benchByYear = Object.fromEntries((yearly.spy || []).map(y => [y.year, y]));
+
+  // Monthly rows oldest→newest with running cumulative; shown newest-first.
+  const rows = [];
+  let cum = 1;
+  for (let i = 0; i < stratRet.length; i++) {
+    cum *= (1 + (stratRet[i] || 0));
+    rows.push({ date: months[i], r: stratRet[i], cum: cum - 1, b: benchRet[i] });
+  }
+  const rowsNewestFirst = rows.slice().reverse();
+  const yearMaxAbs = stratYears.reduce((m, y) => Math.max(m, Math.abs(y.return_pct)), 0.01);
+
+  const card = { background: theme.card, border: `1px solid ${theme.border}`,
+                 borderRadius: 6, padding: '14px 16px' };
+  const th = { textAlign: 'right', padding: '6px 8px', fontWeight: 500,
+               borderBottom: `1px solid ${theme.border}` };
+  const td = { padding: '6px 8px', textAlign: 'right',
+               fontFamily: 'JetBrains Mono, monospace' };
+  const stickyTh = { ...th, position: 'sticky', top: 0, background: theme.card, zIndex: 1 };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between',
+                     alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 14, fontWeight: 700, fontFamily: headingFont || 'inherit' }}>
+          Earnings breakdown
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 10, color: theme.muted, textTransform: 'uppercase',
+                          letterSpacing: '0.05em' }}>Sleeve</span>
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {holdKeys.map(k => (
+              <button key={k} onClick={() => setSelKey(k)} style={{
+                padding: '4px 9px', fontSize: 11, fontWeight: 600,
+                fontFamily: 'JetBrains Mono, monospace',
+                border: `1px solid ${k === effKey ? accent.color : theme.border}`,
+                background: k === effKey ? accent.light : '#fff',
+                color: k === effKey ? accent.dark : theme.muted,
+                borderRadius: 5, cursor: 'pointer',
+              }}>{k}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid',
+                     gridTemplateColumns: isNarrow ? '1fr' : '1fr 1.25fr', gap: 12 }}>
+        {/* Year-over-year */}
+        <div style={card}>
+          <div style={{ display: 'flex', justifyContent: 'space-between',
+                         alignItems: 'baseline', marginBottom: 6 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, fontFamily: headingFont || 'inherit' }}>
+              Year-by-year return
+            </div>
+            <div style={{ fontSize: 11, color: theme.muted,
+                           fontFamily: 'JetBrains Mono, monospace' }}>
+              {stratLabel} vs {benchLabel}
+            </div>
+          </div>
+          {stratYears.length ? (
+            <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse',
+                            fontFamily: 'JetBrains Mono, monospace' }}>
+              <thead>
+                <tr style={{ color: theme.muted, fontSize: 10, textTransform: 'uppercase',
+                              letterSpacing: '0.05em' }}>
+                  <th style={{ ...th, textAlign: 'left' }}>Year</th>
+                  <th style={th}>Strategy</th>
+                  <th style={th}>{benchLabel}</th>
+                  <th style={th}>+/−</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stratYears.map(y => {
+                  const b = benchByYear[y.year];
+                  const diff = b ? y.return_pct - b.return_pct : null;
+                  const barPct = Math.min(100, Math.abs(y.return_pct) / yearMaxAbs * 100);
+                  return (
+                    <tr key={y.year} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                      <td style={{ padding: '6px 8px', color: theme.text, fontWeight: 600 }}>
+                        {y.year}
+                        {y.partial && (
+                          <span style={{ color: theme.muted, fontWeight: 400, fontSize: 10 }}>
+                            {' '}· {y.months}mo
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ ...td, position: 'relative', color: colorOf(y.return_pct),
+                                    fontWeight: 600 }}>
+                        <span style={{ position: 'absolute', right: 2, top: 3, bottom: 3,
+                                        width: `${barPct}%`,
+                                        background: y.return_pct >= 0 ? green : red,
+                                        opacity: 0.12, borderRadius: 2 }} />
+                        <span style={{ position: 'relative' }}>{fmtPct(y.return_pct, 1)}</span>
+                      </td>
+                      <td style={{ ...td, color: colorOf(b ? b.return_pct : null) }}>
+                        {b ? fmtPct(b.return_pct, 1) : '—'}
+                      </td>
+                      <td style={{ ...td, color: colorOf(diff) }}>
+                        {diff == null ? '—' : fmtPct(diff, 1)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          ) : (
+            <div style={{ fontSize: 11, color: theme.muted, fontStyle: 'italic' }}>
+              Not enough history for a full calendar year.
+            </div>
+          )}
+        </div>
+
+        {/* Month-by-month earnings */}
+        <div style={card}>
+          <div style={{ display: 'flex', justifyContent: 'space-between',
+                         alignItems: 'baseline', marginBottom: 6 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, fontFamily: headingFont || 'inherit' }}>
+              Monthly earnings
+            </div>
+            <div style={{ fontSize: 11, color: theme.muted,
+                           fontFamily: 'JetBrains Mono, monospace' }}>
+              {rows.length} months · newest first
+            </div>
+          </div>
+          <div style={{ maxHeight: 340, overflowY: 'auto' }}>
+            <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse',
+                            fontFamily: 'JetBrains Mono, monospace' }}>
+              <thead>
+                <tr style={{ color: theme.muted, fontSize: 10, textTransform: 'uppercase',
+                              letterSpacing: '0.05em' }}>
+                  <th style={{ ...stickyTh, textAlign: 'left' }}>Month</th>
+                  <th style={stickyTh}>Strategy</th>
+                  <th style={stickyTh}>Cumulative</th>
+                  <th style={stickyTh}>{benchLabel}</th>
+                  <th style={stickyTh}>+/−</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rowsNewestFirst.map((row, i) => {
+                  const diff = (row.r != null && row.b != null) ? row.r - row.b : null;
+                  return (
+                    <tr key={i} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                      <td style={{ padding: '6px 8px', color: theme.text }}>
+                        {row.date ? fmtMonthYear(row.date) : '—'}
+                      </td>
+                      <td style={{ ...td, color: colorOf(row.r), fontWeight: 600 }}>
+                        {fmtPct(row.r, 2)}
+                      </td>
+                      <td style={{ ...td, color: colorOf(row.cum) }}>{fmtPct(row.cum, 1)}</td>
+                      <td style={{ ...td, color: colorOf(row.b) }}>{fmtPct(row.b, 2)}</td>
+                      <td style={{ ...td, color: colorOf(diff) }}>
+                        {diff == null ? '—' : fmtPct(diff, 2)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 Object.assign(window, {
   EquityCurveChart, EventStudyChart, DrawdownChart, MonthlyHeatmap, Sparkline,
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
   PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
-  RebalancePanel,
+  RebalancePanel, EarningsBreakdown,
 });
