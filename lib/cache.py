@@ -10,6 +10,8 @@ Tickers list is cached separately at `cache/tickers.json` with a 24h TTL.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -94,16 +96,36 @@ def _load_meta() -> dict | None:
         return None
 
 
+def _atomic_write(dest: Path, write: Callable[[Path], None]) -> None:
+    """Write via a temp file in the same directory, then atomically replace
+    ``dest``. A crash, a full disk, or a second process writing concurrently can
+    then only ever leave ``dest`` as the complete old file or the complete new
+    one — never the half-written, unreadable mix that yfinance-driven delta
+    saves used to produce (corrupt parquet page headers). ``mkstemp`` gives
+    every call a unique scratch file, so two requests saving at once (FastAPI
+    runs sync endpoints in a threadpool) can't interleave into a shared temp."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        write(tmp)
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _save(prices: pd.DataFrame) -> None:
     CACHE_DIR.mkdir(exist_ok=True)
     prices = prices.sort_index()
-    prices.to_parquet(PRICES_PARQUET)
-    PRICES_META.write_text(json.dumps({
+    _atomic_write(PRICES_PARQUET, prices.to_parquet)
+    meta = json.dumps({
         "start": prices.index.min().strftime("%Y-%m-%d"),
         "end": prices.index.max().strftime("%Y-%m-%d"),
         "tickers": sorted(prices.columns.tolist()),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }))
+    })
+    _atomic_write(PRICES_META, lambda p: p.write_text(meta))
 
 
 def clear() -> None:
@@ -157,7 +179,20 @@ def get_prices_cached(
         _save(prices)
         return _slice(prices, *requested, tickers)
 
-    cached = pd.read_parquet(PRICES_PARQUET)
+    try:
+        cached = pd.read_parquet(PRICES_PARQUET)
+    except Exception as exc:
+        # A partial/interrupted write can leave the parquet with intact PAR1
+        # magic but corrupt page headers ("Couldn't deserialize thrift …"),
+        # which would otherwise brick every request since the meta still looks
+        # valid. Treat an unreadable cache as a miss and re-download rather than
+        # propagating a fatal error to the dashboard.
+        status(f"Cache unreadable ({exc}); re-downloading {len(tickers)} tickers "
+               f"from {start} to {end}")
+        prices = fetcher(tickers, start, end)
+        _save(prices)
+        return _slice(prices, *requested, tickers)
+
     cached_start = pd.Timestamp(meta["start"])
     cached_end = pd.Timestamp(meta["end"])
     cached_tickers = set(meta["tickers"])
