@@ -225,6 +225,7 @@ def rebalance_schedule(
         curr_set = set(curr)
         out.append({
             "month": monthly_returns.index[i].strftime("%Y-%m"),
+            "picks": curr,
             "buys": [t for t in curr if t not in prev_set],
             "sells": [t for t in prev if t not in curr_set],
             "holds": [t for t in curr if t in prev_set],
@@ -275,6 +276,92 @@ def top_performers_period(
             "end_price": float(end_row[ticker]),
         })
     return rows
+
+
+# Average calendar days per month. A ``rank_lookback`` of N months maps to
+# ``round(N * _MONTH_DAYS)`` calendar days, so the live current target uses the
+# same trailing window the Top Performers leaderboard does (1 month -> 30 days,
+# matching its default).
+_MONTH_DAYS = 30.4375
+
+
+def current_target(
+    prices: pd.DataFrame,
+    top_n: int,
+    rank_lookback: int,
+) -> dict | None:
+    """The momentum portfolio *as of the latest price bar*.
+
+    Ranks by simple return over a trailing window of ``rank_lookback`` months
+    (converted to calendar days), anchored on the last available bar — the exact
+    same signal :func:`top_performers_period` uses. This is what makes the
+    dashboard's "current target" line up with the Top Performers leaderboard at
+    matching settings, instead of ranking on a 1-3 trading-day partial calendar
+    month right after a month-end.
+
+    Returns ``{tickers, as_of, start_date, days}`` (tickers ordered by return,
+    highest first), or ``None`` when there isn't enough price data.
+    """
+    days = round(rank_lookback * _MONTH_DAYS)
+    ranked = top_performers_period(prices, top_n=top_n, days=days)
+    if not ranked:
+        return None
+    return {
+        "tickers": [r["ticker"] for r in ranked],
+        "as_of": ranked[0]["end_date"],
+        "start_date": ranked[0]["start_date"],
+        "days": days,
+    }
+
+
+def live_rebalance(
+    prices: pd.DataFrame,
+    monthly_returns: pd.DataFrame,
+    top_n: int,
+    rank_lookback: int,
+    n_months: int = 13,
+) -> list[dict]:
+    """Rebalance trade list for the dashboard: a live "as of today" target row
+    on top, followed by the completed month-end rebalance rows.
+
+    The live row (``is_live=True``) ranks by :func:`current_target` — a trailing
+    window ending on the latest bar — and diffs against the most recent
+    *completed* month's picks (what you'd be holding from the last month-end
+    rebalance). The in-progress (partial) month is dropped from the history rows
+    so it isn't shown twice. History rows are the untouched month-end sleeve.
+
+    Falls back to the raw :func:`rebalance_schedule` output if there isn't enough
+    daily data to form a live target.
+    """
+    history = rebalance_schedule(
+        monthly_returns, top_n=top_n, rank_lookback=rank_lookback, n_months=n_months,
+    )
+    live = current_target(prices, top_n=top_n, rank_lookback=rank_lookback)
+    if live is None:
+        return history
+
+    # The newest monthly bar is "in progress" when the latest price bar predates
+    # its calendar month-end label (e.g. a mid-month run). Drop that partial row
+    # — the live row supersedes it.
+    partial_month = None
+    if len(monthly_returns.index) and prices.index.max() < monthly_returns.index[-1]:
+        partial_month = monthly_returns.index[-1].strftime("%Y-%m")
+    completed = [row for row in history if row["month"] != partial_month]
+
+    prev = completed[0]["picks"] if completed else []
+    prev_set = set(prev)
+    target = live["tickers"]
+    target_set = set(target)
+    live_row = {
+        "month": live["as_of"],
+        "as_of": live["as_of"],
+        "is_live": True,
+        "picks": target,
+        "buys": [t for t in target if t not in prev_set],
+        "sells": [t for t in prev if t not in target_set],
+        "holds": [t for t in target if t in prev_set],
+    }
+    return ([live_row] + completed)[:n_months]
 
 
 def rolling_sharpe(

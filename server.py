@@ -245,8 +245,12 @@ def _run_backtest(params: BacktestParams) -> dict:
         ]
 
     # ---- Monthly rebalance trade list (1-month-hold sleeve) ----
-    rebalance = analysis.rebalance_schedule(
-        monthly, top_n=params.topN, rank_lookback=params.rankLookback, n_months=13,
+    # The top row is a live target ranked on a trailing window ending on the
+    # latest bar (same signal as Top Performers), not the partial calendar month;
+    # history rows below are the month-end sleeve, unchanged.
+    rebalance = analysis.live_rebalance(
+        constituents, monthly, top_n=params.topN,
+        rank_lookback=params.rankLookback, n_months=13,
     )
     for r in rebalance:
         tickers_in_row = set(r["buys"]) | set(r["sells"]) | set(r["holds"])

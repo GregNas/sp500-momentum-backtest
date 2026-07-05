@@ -854,9 +854,10 @@ function RebalancePanel({ rebalance, topN, rankLookback, universe = 'sp500',
             Monthly rebalance · trade list
           </div>
           <div style={{ fontSize: 11, color: theme.muted, marginTop: 2, lineHeight: 1.5 }}>
-            Hold the top {topN} by prior {rankLookback}m return; rebalance in full at each
-            month-end close (the 1-month-hold sleeve). The top row is the current target
-            portfolio — it shifts as the month in progress accrues data.
+            Hold the top {topN} by trailing {rankLookback}m return; rebalance in full at each
+            month-end close (the 1-month-hold sleeve). The top row is the live target as of
+            the latest price — ranked over a trailing {rankLookback}-month window ending today,
+            the same signal as Top performers. History rows below are the month-end sleeve.
           </div>
         </div>
         <button onClick={downloadCsv} style={{
@@ -875,10 +876,11 @@ function RebalancePanel({ rebalance, topN, rankLookback, universe = 'sp500',
       }}>
         <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10,
                        fontFamily: 'JetBrains Mono, monospace' }}>
-          {latest.month}
+          {latest.is_live ? 'live' : latest.month}
           <span style={{ fontWeight: 400, color: theme.muted, marginLeft: 8,
                           fontFamily: 'Inter, sans-serif', fontSize: 11 }}>
-            current target — {latest.buys.length} in, {latest.sells.length} out,
+            {latest.is_live ? `current target · as of ${latest.as_of} — ` : 'current target — '}
+            {latest.buys.length} in, {latest.sells.length} out,
             {' '}{latest.holds.length} unchanged
           </span>
         </div>

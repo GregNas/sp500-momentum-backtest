@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from lib import analysis
+from lib import data as datalib
 
 
 def _months(n, start="2000-01-31"):
@@ -112,3 +113,71 @@ def test_calendar_year_returns_full_year_not_partial():
 
 def test_calendar_year_returns_empty():
     assert analysis.calendar_year_returns(pd.Series(dtype=float)) == []
+
+
+# ---- live current target anchored to the run date ----
+
+def _daily_prices(tickers, start="2026-01-01", end="2026-07-02", seed=0):
+    """Deterministic daily (business-day) prices as a geometric random walk.
+
+    The last bar (2026-07-02) sits mid-month, so the newest monthly bar is a
+    partial 'in-progress' month — the case the live target replaces.
+    """
+    idx = pd.bdate_range(start, end)
+    rng = np.random.default_rng(seed)
+    cols = {t: 100.0 * np.exp(np.cumsum(rng.normal(0.0005, 0.02, len(idx))))
+            for t in tickers}
+    return pd.DataFrame(cols, index=idx)
+
+
+_MONTH_DAYS = 30.4375  # avg calendar days per month; 1 month -> 30 days (matches Top Performers default)
+
+
+def test_current_target_matches_top_performers_signal():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=1)
+    ct = analysis.current_target(prices, top_n=3, rank_lookback=1)
+    days = round(1 * _MONTH_DAYS)
+    tp = analysis.top_performers_period(prices, top_n=3, days=days)
+    assert ct["tickers"] == [r["ticker"] for r in tp]
+    assert ct["as_of"] == prices.index.max().strftime("%Y-%m-%d")
+    assert ct["days"] == days
+
+
+def test_current_target_none_when_empty():
+    assert analysis.current_target(pd.DataFrame(), top_n=3, rank_lookback=1) is None
+
+
+def test_rebalance_schedule_exposes_picks():
+    prices = _daily_prices([f"T{i}" for i in range(5)], seed=2)
+    monthly = datalib.to_monthly_returns(prices)
+    rows = analysis.rebalance_schedule(monthly, top_n=2, rank_lookback=1, n_months=6)
+    assert rows, "expected at least one rebalance row"
+    for row in rows:
+        assert len(row["picks"]) == 2
+        assert set(row["picks"]) == set(row["buys"]) | set(row["holds"])
+
+
+def test_live_rebalance_prepends_live_row_diffed_vs_last_completed_month():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=3)
+    monthly = datalib.to_monthly_returns(prices)
+    reb = analysis.live_rebalance(prices, monthly, top_n=3, rank_lookback=1)
+
+    # Top row is the live snapshot, anchored on the latest bar.
+    assert reb[0]["is_live"] is True
+    assert reb[0]["as_of"] == prices.index.max().strftime("%Y-%m-%d")
+
+    # Its target set equals Top Performers over the same trailing window.
+    tp = analysis.top_performers_period(prices, top_n=3, days=round(_MONTH_DAYS))
+    assert reb[0]["picks"] == [r["ticker"] for r in tp]
+
+    # The in-progress (partial) month is dropped from the history rows.
+    partial = monthly.index[-1].strftime("%Y-%m")
+    assert all(row.get("month") != partial for row in reb[1:])
+
+    # Buys/sells/holds are the set-diff of the live target vs the newest
+    # completed month's picks (what you'd be holding from the last rebalance).
+    prev = reb[1]["picks"]
+    tgt = reb[0]["picks"]
+    assert reb[0]["buys"] == [t for t in tgt if t not in set(prev)]
+    assert reb[0]["sells"] == [t for t in prev if t not in set(tgt)]
+    assert reb[0]["holds"] == [t for t in tgt if t in set(prev)]
