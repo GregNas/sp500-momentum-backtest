@@ -297,11 +297,12 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
     ? bestStrat.strategy.replace(/^top\d+_hold(\d+m)$/, 'h$1')
     : null;
 
-  // Significant horizon (|t|>=2)
-  const sigHorizon = ready && data.EVENT_STUDY
+  // Significant horizons (|t|>=2); callout shows the strongest one
+  const sigHorizons = ready && data.EVENT_STUDY
     ? data.EVENT_STUDY.filter(d => Math.abs(d.t_stat) >= 2)
-                       .sort((a, b) => Math.abs(b.t_stat) - Math.abs(a.t_stat))[0]
-    : null;
+                       .sort((a, b) => Math.abs(b.t_stat) - Math.abs(a.t_stat))
+    : [];
+  const sigHorizon = sigHorizons[0] || null;
 
   const cohortCount = ready && data.EVENT_STUDY[0] ? data.EVENT_STUDY[0].n : '—';
 
@@ -536,7 +537,9 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                                   fontFamily: 'JetBrains Mono, monospace' }}>
                     h={sigHorizon.h}
                   </span>
-                  <span>α = {fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark} · t = {sigHorizon.t_stat.toFixed(2)} — only horizon clearing the 5% significance bar.</span>
+                  <span>α = {fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark} · t = {sigHorizon.t_stat.toFixed(2)} — {sigHorizons.length > 1
+                    ? `strongest of ${sigHorizons.length} horizons clearing the 5% significance bar.`
+                    : 'only horizon clearing the 5% significance bar.'}</span>
                 </div>
               ) : (
                 <div style={{

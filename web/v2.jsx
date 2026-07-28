@@ -293,11 +293,12 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
     ? `${fmtMonthYear(months[0])}–${fmtMonthYear(months[months.length - 1])}`
     : '—';
 
-  // Find a significant horizon for the verdict callout
-  const sigHorizon = ready
+  // Significant horizons (|t|>=2) for the verdict callout
+  const sigHorizons = ready
     ? data.EVENT_STUDY.filter(d => Math.abs(d.t_stat) >= 2)
-                       .sort((a, b) => Math.abs(b.t_stat) - Math.abs(a.t_stat))[0]
-    : null;
+                       .sort((a, b) => Math.abs(b.t_stat) - Math.abs(a.t_stat))
+    : [];
+  const sigHorizon = sigHorizons[0] || null;
 
   const heatmapValues = bestKey && data?.MONTHLY_RETURNS?.[bestKey];
   const bestMonth = heatmapValues ? Math.max(...heatmapValues) : null;
@@ -636,7 +637,9 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
               }}>
                 <strong>Verdict:</strong>{' '}
                 {sigHorizon
-                  ? <>winners keep winning at <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600 }}>h={sigHorizon.h}</span> (t={sigHorizon.t_stat.toFixed(2)}, α={fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark}). Other horizons are noise — be skeptical.</>
+                  ? (sigHorizons.length > 1
+                      ? <>winners keep winning — {sigHorizons.length} of {data.EVENT_STUDY.length} horizons clear |t| ≥ 2, strongest at <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600 }}>h={sigHorizon.h}</span> (t={sigHorizon.t_stat.toFixed(2)}, α={fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark}).</>
+                      : <>winners keep winning at <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600 }}>h={sigHorizon.h}</span> (t={sigHorizon.t_stat.toFixed(2)}, α={fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark}). Other horizons are noise — be skeptical.</>)
                   : <>no horizon clears 5% significance (|t| ≥ 2). On this run, the alpha is indistinguishable from noise.</>
                 }
               </div>
