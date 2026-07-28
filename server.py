@@ -6,10 +6,12 @@ Run:
 
 from __future__ import annotations
 
+import re
+import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,8 @@ from lib import analysis, cache, data, universes
 
 UniverseKey = Literal["sp500", "global_etfs", "us_sector_etfs"]
 
-WEB_DIR = Path(__file__).parent / "web"
+ROOT_DIR = Path(__file__).resolve().parent
+WEB_DIR = ROOT_DIR / "web"
 
 app = FastAPI(title="S&P 500 Momentum Backtest")
 
@@ -50,6 +53,145 @@ class TopPerformersParams(BaseModel):
     topN: int = Field(10, ge=1, le=100)
     days: int = Field(30, ge=1, le=365)
     runId: Optional[str] = None
+
+
+# ---- build info (version badge + "What's new" feed) ----
+
+# Bump by hand on a release. The trailing YYMMDDHH is derived from the code,
+# never hand-edited.
+APP_VERSION = "1.1"
+
+# Date the "What's new" feed starts from, inclusive. Fixed on purpose: a rolling
+# "last 24h" window would silently drop entries as time passes. There are no
+# commits on 2026-07-27 itself, so this captures the 2026-07-28 work and
+# excludes the 2026-07-05 and earlier history.
+WHATS_NEW_SINCE = "2026-07-27"
+WHATS_NEW_MAX_ENTRIES = 100
+
+GIT_TIMEOUT_S = 3.0
+
+# ASCII unit/record separators. Commit bodies contain blank lines and trailers,
+# so newline- or blank-line-delimited git output cannot be parsed unambiguously;
+# these two bytes cannot occur in a commit message.
+_FIELD_SEP = "\x1f"
+_RECORD_SEP = "\x1e"
+
+# Files whose mtime stands in for the commit date when git is unavailable.
+_SOURCE_GLOBS = ("server.py", "lib/*.py", "web/*")
+
+_COAUTHOR_RE = re.compile(r"^[ \t]*Co-Authored-By:.*(?:\n|$)", re.IGNORECASE | re.MULTILINE)
+
+
+def _git(args: List[str]) -> Optional[str]:
+    """stdout of a git command run in the project root, or None on any failure.
+
+    A deployed copy may have no .git directory and no git binary at all, so
+    every failure mode (missing binary, not a repo, non-zero exit, timeout)
+    collapses to None rather than an exception.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ROOT_DIR)] + list(args),
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False,
+        )
+    except Exception:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _mtime_stamp() -> Optional[str]:
+    """Newest source-file mtime as YYMMDDHH, or None if nothing is readable."""
+    newest = None
+    for pattern in _SOURCE_GLOBS:
+        for path in ROOT_DIR.glob(pattern):
+            try:
+                if not path.is_file():
+                    continue
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    if newest is None:
+        return None
+    return datetime.fromtimestamp(newest).strftime("%y%m%d%H")
+
+
+def _build_stamp() -> Tuple[Optional[str], str]:
+    """(YYMMDDHH, source) identifying the deployed code. Never raises.
+
+    Prefers the last commit date so the stamp tracks the code, not a file touch;
+    falls back to mtimes, then gives up rather than blocking startup.
+    """
+    out = _git(["log", "-1", "--format=%cd", "--date=format:%y%m%d%H"])
+    if out:
+        stamp = out.strip()
+        if re.fullmatch(r"\d{8}", stamp):
+            return stamp, "git"
+    try:
+        stamp = _mtime_stamp()
+    except Exception:
+        stamp = None
+    if stamp:
+        return stamp, "mtime"
+    return None, "unknown"
+
+
+def strip_coauthor_trailers(body: str) -> str:
+    """Drop Co-Authored-By trailers: plumbing, not user-facing news."""
+    return _COAUTHOR_RE.sub("", body).strip()
+
+
+def parse_git_log(raw: str, max_entries: int = WHATS_NEW_MAX_ENTRIES) -> List[dict]:
+    """Parse `git log` output formatted with _FIELD_SEP/_RECORD_SEP into entries.
+
+    Bodies keep their internal blank lines; only the Co-Authored-By trailers and
+    surrounding whitespace are removed.
+    """
+    entries: List[dict] = []
+    for record in raw.split(_RECORD_SEP):
+        if not record.strip():
+            continue
+        fields = record.split(_FIELD_SEP)
+        if len(fields) < 4:
+            continue
+        commit_hash, date, subject = (f.strip() for f in fields[:3])
+        if not commit_hash:
+            continue
+        entries.append({
+            "date": date,
+            "hash": commit_hash,
+            "subject": subject,
+            "body": strip_coauthor_trailers(fields[3]),
+        })
+        if len(entries) >= max_entries:
+            break
+    return entries
+
+
+def _whats_new_entries() -> Tuple[List[dict], str]:
+    """(entries, source) newest first. source is "git" or "unavailable"."""
+    fmt = _FIELD_SEP.join(["%h", "%cd", "%s", "%b"]) + _RECORD_SEP
+    raw = _git([
+        "log",
+        "--since=" + WHATS_NEW_SINCE,
+        "--max-count=" + str(WHATS_NEW_MAX_ENTRIES),
+        "--date=format:%Y-%m-%d",
+        "--format=" + fmt,
+    ])
+    if raw is None:
+        return [], "unavailable"
+    try:
+        return parse_git_log(raw), "git"
+    except Exception:
+        return [], "unavailable"
+
+
+# Computed once at import: the version identifies the deployed code, so it only
+# changes on restart anyway, and no request should pay for a subprocess.
+_BUILD_STAMP, VERSION_SOURCE = _build_stamp()
+VERSION = "{}.{}".format(APP_VERSION, _BUILD_STAMP or "unknown")
+WHATS_NEW, WHATS_NEW_SOURCE = _whats_new_entries()
 
 
 def _safe_floats(series: pd.Series) -> list:
@@ -439,6 +581,18 @@ def universe_info() -> dict:
             "default_benchmark": universes.DEFAULT_BENCHMARK.get(key, "SPY"),
         }
     return out
+
+
+@app.get("/api/version")
+def version_info() -> dict:
+    """Deployed build stamp. `source` lets the UI be honest about provenance."""
+    return {"version": VERSION, "source": VERSION_SOURCE}
+
+
+@app.get("/api/whats-new")
+def whats_new() -> dict:
+    """Commits from WHATS_NEW_SINCE onward, newest first."""
+    return {"entries": WHATS_NEW, "since": WHATS_NEW_SINCE, "source": WHATS_NEW_SOURCE}
 
 
 @app.get("/api/cache")

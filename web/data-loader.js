@@ -76,6 +76,22 @@ async function clearCache() {
   await fetch('/api/cache/clear', { method: 'POST' });
 }
 
+// Build stamp for the version badge. {version, source} where source is
+// 'git' | 'mtime' | 'unknown'.
+async function fetchVersion() {
+  const r = await fetch('/api/version');
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+// Change feed for the What's new modal. source 'unavailable' means this copy
+// has no git metadata, which the UI states rather than showing an empty list.
+async function fetchWhatsNew() {
+  const r = await fetch('/api/whats-new');
+  if (!r.ok) return null;
+  return await r.json();
+}
+
 // ---- formatters ----
 function fmtMonthShort(d) {
   return d.toLocaleDateString('en-US', { month: 'short' });
@@ -116,6 +132,7 @@ function fmtAge(hours) {
 
 Object.assign(window, {
   runBacktest, fetchTopPerformers, fetchCacheInfo, fetchUniverses, clearCache,
+  fetchVersion, fetchWhatsNew,
   fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtGrowthPct, fmtEquityAxis,
   fmtNum, fmtAge,
 });

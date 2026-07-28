@@ -635,6 +635,9 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
           </>
         )}
       </main>
+
+      {/* Build stamp + What's new (fixed bottom-right, clear of the switcher) */}
+      <BuildInfo theme={v1Theme} accent={v1Accent} />
     </div>
   );
 }

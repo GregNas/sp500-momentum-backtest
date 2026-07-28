@@ -1545,9 +1545,244 @@ function EarningsBreakdown({ data, params, bestKey, theme, accent, headingFont }
   );
 }
 
+// ============================================================
+// BuildInfo — bottom-right chrome shared by V1 and V2: the deployed build
+// stamp plus a "What's new" modal fed by git log. Anchored bottom-right so it
+// never meets the top-right variation switcher; kept small and low-contrast
+// with a translucent backdrop because <main> scrolls underneath it.
+// ============================================================
+
+// 'YYYY-MM-DD' -> 'Tue, Jul 28, 2026'. Parsed as local parts on purpose:
+// new Date(iso) reads the string as UTC midnight and renders the previous
+// day anywhere west of GMT.
+function fmtIsoDay(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
+  if (!m) return iso || '—';
+  return new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString('en-US', {
+    weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
+  });
+}
+
+// Entries arrive newest first; group consecutive same-date runs without resorting.
+function groupByDate(entries) {
+  const groups = [];
+  (entries || []).forEach(e => {
+    const last = groups[groups.length - 1];
+    if (last && last.date === e.date) last.entries.push(e);
+    else groups.push({ date: e.date, entries: [e] });
+  });
+  return groups;
+}
+
+const VERSION_SOURCE_NOTE = {
+  git: 'Derived from the last commit date.',
+  mtime: 'No git metadata here, so this is the newest source-file date, not a commit.',
+  unknown: 'Neither git nor file dates were readable, so the build date is unknown.',
+};
+
+function WhatsNewModal({ feed, loading, error, onClose, closeRef, theme, accent, headingFont }) {
+  const groups = groupByDate(feed && feed.entries);
+  const unavailable = feed && feed.source === 'unavailable';
+
+  return (
+    <div onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+         style={{
+           position: 'fixed', inset: 0, zIndex: 200,
+           background: 'rgba(28,25,23,0.42)',
+           display: 'flex', alignItems: 'center', justifyContent: 'center',
+           padding: 20,
+         }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="whats-new-title"
+           style={{
+             background: theme.card, color: theme.text,
+             border: `1px solid ${theme.border}`, borderRadius: 10,
+             boxShadow: '0 18px 50px rgba(0,0,0,0.22)',
+             width: 'min(640px, 100%)', maxHeight: '82vh',
+             display: 'flex', flexDirection: 'column',
+           }}>
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between',
+          gap: 12, padding: '14px 18px', borderBottom: `1px solid ${theme.border}`,
+        }}>
+          <div>
+            <h2 id="whats-new-title"
+                style={{ margin: 0, fontSize: 15, fontWeight: 700,
+                          fontFamily: headingFont || 'inherit', letterSpacing: '-0.01em' }}>
+              What's new
+            </h2>
+            <div style={{ fontSize: 11, color: theme.muted, marginTop: 3,
+                           fontFamily: 'JetBrains Mono, monospace' }}>
+              {feed && feed.since ? `changes since ${feed.since}` : 'recent changes'}
+              {groups.length ? ` · ${(feed.entries || []).length} commits` : ''}
+            </div>
+          </div>
+          <button ref={closeRef} onClick={onClose} aria-label="Close what's new"
+                  style={{
+                    flexShrink: 0, padding: '4px 9px', fontSize: 11, fontWeight: 600,
+                    color: theme.muted, background: 'transparent',
+                    border: `1px solid ${theme.border}`, borderRadius: 5, cursor: 'pointer',
+                  }}>
+            Close
+          </button>
+        </div>
+
+        <div style={{ overflowY: 'auto', padding: '14px 18px 18px' }}>
+          {loading && (
+            <div style={{ fontSize: 12, color: theme.muted }}>Loading changes…</div>
+          )}
+          {!loading && error && (
+            <div style={{ fontSize: 12, color: '#b91c1c' }}>
+              Could not load the change feed: {error}
+            </div>
+          )}
+          {!loading && !error && unavailable && (
+            <div style={{ fontSize: 12, color: theme.muted, lineHeight: 1.6 }}>
+              Change history is unavailable in this copy: it has no git metadata
+              (no repository or no git binary on the host). The version badge
+              still identifies the build.
+            </div>
+          )}
+          {!loading && !error && !unavailable && !groups.length && (
+            <div style={{ fontSize: 12, color: theme.muted }}>
+              No changes recorded since {feed && feed.since ? feed.since : 'the cutoff'}.
+            </div>
+          )}
+          {groups.map(g => (
+            <div key={g.date} style={{ marginBottom: 18 }}>
+              <div style={{
+                fontSize: 10, fontWeight: 700, color: accent.dark,
+                letterSpacing: '0.1em', textTransform: 'uppercase',
+                paddingBottom: 5, marginBottom: 10,
+                borderBottom: `1px solid ${theme.border}`,
+              }}>
+                {fmtIsoDay(g.date)}
+              </div>
+              {g.entries.map(e => (
+                <div key={e.hash} style={{ marginBottom: 12 }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+                    <code style={{ fontSize: 10, color: theme.muted, flexShrink: 0,
+                                    fontFamily: 'JetBrains Mono, monospace' }}>
+                      {e.hash}
+                    </code>
+                    <div style={{ fontSize: 13, fontWeight: 600, lineHeight: 1.45 }}>
+                      {e.subject}
+                    </div>
+                  </div>
+                  {e.body && (
+                    <div style={{
+                      marginTop: 5, marginLeft: 8, paddingLeft: 10,
+                      borderLeft: `2px solid ${theme.border}`,
+                      fontSize: 12, color: theme.muted, lineHeight: 1.6,
+                      whiteSpace: 'pre-wrap',
+                    }}>
+                      {e.body}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BuildInfo({ theme, accent, headingFont }) {
+  const [build, setBuild] = useState(null);
+  const [open, setOpen] = useState(false);
+  const [feed, setFeed] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const closeRef = useRef(null);
+
+  useEffect(() => {
+    let live = true;
+    fetchVersion()
+      .then(v => { if (live) setBuild(v); })
+      .catch(() => { /* the badge is chrome: a failure just leaves it blank */ });
+    return () => { live = false; };
+  }, []);
+
+  // Escape to dismiss, focus into the dialog, focus restored on unmount. No
+  // body scroll lock: <main> is the scroller and body never scrolls, so there
+  // is nothing to lock and nothing that can stay stuck.
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement;
+    const focusTimer = setTimeout(() => {
+      if (closeRef.current) closeRef.current.focus();
+    }, 0);
+    const onKeyDown = e => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      clearTimeout(focusTimer);
+      document.removeEventListener('keydown', onKeyDown);
+      if (previous && previous.focus) previous.focus();
+    };
+  }, [open]);
+
+  // Fetched on first open, then kept: the feed is fixed at server import.
+  const onOpen = () => {
+    setOpen(true);
+    if (feed || loading) return;
+    setLoading(true);
+    setError(null);
+    fetchWhatsNew()
+      .then(f => setFeed(f || { entries: [], since: null, source: 'unavailable' }))
+      .catch(e => setError(e.message || 'request failed'))
+      .finally(() => setLoading(false));
+  };
+
+  const source = (build && build.source) || 'unknown';
+  const versionText = build ? build.version : '—';
+
+  return (
+    <>
+      <div style={{
+        position: 'fixed', bottom: 10, right: 12, zIndex: 45,
+        display: 'flex', alignItems: 'center', gap: 7,
+        padding: '3px 5px 3px 9px',
+        background: 'rgba(255,255,255,0.82)',
+        backdropFilter: 'blur(8px)',
+        border: `1px solid ${theme.border}`,
+        borderRadius: 7,
+        boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+      }}>
+        <span title={`Build ${versionText}. ${VERSION_SOURCE_NOTE[source] || ''}`}
+              style={{ fontSize: 10, color: theme.muted, letterSpacing: '0.02em',
+                        fontFamily: 'JetBrains Mono, monospace' }}>
+          {versionText}
+        </span>
+        {/* Kept out of the version string so its format stays exactly 1.1.YYMMDDHH. */}
+        {build && source !== 'git' && (
+          <span style={{ fontSize: 9, color: theme.muted, opacity: 0.75 }}>
+            {source === 'mtime' ? '(file date)' : '(no build date)'}
+          </span>
+        )}
+        <button onClick={onOpen} aria-haspopup="dialog" aria-expanded={open}
+                style={{
+                  padding: '3px 8px', fontSize: 10, fontWeight: 600,
+                  color: accent.dark, background: 'transparent',
+                  border: `1px solid ${theme.border}`, borderRadius: 5,
+                  cursor: 'pointer', letterSpacing: '0.02em',
+                }}>
+          What's new
+        </button>
+      </div>
+
+      {open && (
+        <WhatsNewModal feed={feed} loading={loading} error={error}
+                       onClose={() => setOpen(false)} closeRef={closeRef}
+                       theme={theme} accent={accent} headingFont={headingFont} />
+      )}
+    </>
+  );
+}
+
 Object.assign(window, {
   EquityCurveChart, EventStudyChart, DrawdownChart, MonthlyHeatmap, Sparkline,
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
   PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
-  RebalancePanel, EarningsBreakdown,
+  RebalancePanel, EarningsBreakdown, BuildInfo, WhatsNewModal,
 });

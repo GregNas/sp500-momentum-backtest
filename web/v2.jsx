@@ -894,6 +894,10 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
           </>
         )}
       </main>
+
+      {/* Build stamp + What's new (fixed bottom-right, clear of the switcher) */}
+      <BuildInfo theme={v2Theme} accent={v2Accent}
+                 headingFont='"Source Serif Pro", Georgia, serif' />
     </div>
   );
 }
