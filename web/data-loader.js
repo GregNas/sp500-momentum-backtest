@@ -60,6 +60,37 @@ async function fetchTopPerformers(params) {
   return await r.json();
 }
 
+// Record the live target to the local out-of-sample ledger. Settings only —
+// the server recomputes the cohort itself, so a stale tab can't inject one.
+async function recordLedgerTarget(params) {
+  const r = await fetch('/api/ledger/record', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(body.detail || r.statusText || 'Record failed');
+    err.status = r.status;
+    throw err;
+  }
+  return body;
+}
+
+// Recorded targets marked to market. Disk-only unless opts.refresh is set.
+async function fetchLedger(opts) {
+  const q = new URLSearchParams();
+  if (opts && opts.hash) q.set('hash', opts.hash);
+  if (opts && opts.refresh) q.set('refresh', '1');
+  const qs = q.toString();
+  const r = await fetch(`/api/ledger${qs ? `?${qs}` : ''}`);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || 'Ledger fetch failed');
+  }
+  return await r.json();
+}
+
 async function fetchCacheInfo() {
   const r = await fetch('/api/cache');
   if (!r.ok) return null;
@@ -132,7 +163,7 @@ function fmtAge(hours) {
 
 Object.assign(window, {
   runBacktest, fetchTopPerformers, fetchCacheInfo, fetchUniverses, clearCache,
-  fetchVersion, fetchWhatsNew,
+  fetchVersion, fetchWhatsNew, recordLedgerTarget, fetchLedger,
   fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtGrowthPct, fmtEquityAxis,
   fmtNum, fmtAge,
 });

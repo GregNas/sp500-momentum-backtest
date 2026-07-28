@@ -8,6 +8,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# Split-shaped bounds for the ledger's recorded-vs-cached basis audit. Imported
+# rather than redefined so the "verify basis" chip fires on exactly the
+# magnitudes _heal_split_artifacts treats as a re-adjustment: auto_adjust
+# re-adjusts dividends too, so a percent-scale threshold would light up on every
+# aged row. (Constants only — this module still does no I/O.)
+from lib.cache import SPLIT_JUMP_HI, SPLIT_JUMP_LO
+
 
 def momentum_signal(
     monthly_returns: pd.DataFrame,
@@ -165,6 +172,115 @@ def event_study_summary(events: pd.DataFrame, benchmark_monthly: pd.Series) -> p
     return summary
 
 
+_DETAIL_COLUMNS = ["gross", "trade", "turnover", "cost", "net"]
+
+
+def momentum_backtest_detail(
+    monthly_returns: pd.DataFrame,
+    top_n: int,
+    hold_period: int,
+    rank_lookback: int,
+    skip_months: int = 0,
+    cost_bps: float = 0.0,
+    signal: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Jegadeesh-Titman sleeves plus the turnover and trading cost they imply.
+
+    K = ``hold_period`` overlapping equal-weight portfolios, each rebalanced
+    every K months; a month's gross return is the average of the sleeves active
+    that month. Columns, indexed by month:
+
+    ``gross``    what :func:`momentum_backtest` returns.
+    ``trade``    sum of absolute portfolio-weight changes, 0 to 2.
+    ``turnover`` one-way turnover, ``trade / 2`` (1.0 = the book fully replaced).
+    ``cost``     ``cost_bps / 10000 * trade``, charged in the month it happens.
+    ``net``      ``gross - cost``.
+
+    The implied weight of ticker j in month t follows from the sleeve mean:
+    each active sleeve carries 1/S_t of capital and equal-weights the picks that
+    actually have a bar that month, so
+    ``w_t(j) = (1 / S_t) * SUM over sleeves of [j in members] / len(members)``.
+    ``members`` is the post-dropna set, not the raw picks — those are the names
+    ``.mean()`` averages over, and pairing raw picks with a dropna-reduced
+    denominator makes the weights sum above 1 whenever a pick lacks a bar, which
+    bills notional that was never held. S_t is the number of sleeves that
+    produced a return, not ``hold_period``, so the weights sum to 1 during the
+    ramp too.
+
+    ``trade`` compares against the previous *appended* month's weights grown by
+    that month's returns: the book held entering month t is last month's book
+    after price drift, and the sleeve mean re-equal-weights it every month,
+    which is a real trade. A month where every sleeve is empty appends nothing,
+    so the comparison is against the last month that produced a return rather
+    than against ``t-1``. Summing absolute weight changes charges both the sell
+    and the buy side at ``cost_bps``, and bills the opening funding buy
+    (``trade == 1.0``) one side only.
+
+    ``signal`` lets a caller that already holds :func:`momentum_signal`'s output
+    pass it in instead of paying for it again; it is read, never mutated.
+    ``signal=None`` reproduces the internal call exactly.
+    """
+    if signal is None:
+        signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
+
+    picks_cache: dict[int, pd.Index | None] = {}
+
+    def picks_at(i: int) -> pd.Index | None:
+        if i not in picks_cache:
+            ranking = signal.iloc[i].dropna()
+            picks_cache[i] = (ranking.nlargest(top_n).index
+                              if len(ranking) >= top_n else None)
+        return picks_cache[i]
+
+    rate = cost_bps / 10000.0
+    rows: list[list[float]] = []
+    dates = []
+    drifted: pd.Series | None = None      # last month's weights, grown by returns
+    for t in range(rank_lookback + skip_months, len(monthly_returns)):
+        month = monthly_returns.iloc[t]
+        sleeve_returns = []
+        members: list[pd.Index] = []
+        for k in range(hold_period):
+            select_t = t - 1 - k
+            if select_t < rank_lookback - 1 + skip_months:
+                continue
+            picks = picks_at(select_t)
+            if picks is None:
+                continue
+            r = month[picks].dropna()
+            if len(r) > 0:
+                sleeve_returns.append(r.mean())
+                members.append(r.index)
+        if not sleeve_returns:
+            continue
+
+        gross = float(np.mean(sleeve_returns))
+        n_sleeves = len(sleeve_returns)
+        weights: dict = {}
+        for idx in members:
+            share = 1.0 / (n_sleeves * len(idx))
+            for j in idx:
+                weights[j] = weights.get(j, 0.0) + share
+        w = pd.Series(weights, dtype=float)
+
+        if drifted is None:
+            trade = float(w.abs().sum())          # funding buy, one side
+        else:
+            trade = float(w.subtract(drifted, fill_value=0.0).abs().sum())
+        cost = rate * trade
+        rows.append([gross, trade, trade / 2.0, cost, gross - cost])
+        dates.append(monthly_returns.index[t])
+
+        grown = w * (1.0 + month[w.index])
+        total = float(grown.sum())
+        # A total of 0 needs every holding to lose exactly 100% in one month.
+        # Fall back to the undrifted book rather than emit NaN weights.
+        drifted = (grown / total) if total > 0 else w
+
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(dates),
+                        columns=_DETAIL_COLUMNS, dtype=float)
+
+
 def momentum_backtest(
     monthly_returns: pd.DataFrame,
     top_n: int,
@@ -172,36 +288,16 @@ def momentum_backtest(
     rank_lookback: int,
     skip_months: int = 0,
 ) -> pd.Series:
-    """Jegadeesh-Titman: K overlapping equal-weight portfolios, each rebalanced
-    every K months. Each month's strategy return = average return of the K
-    currently-active portfolios.
+    """Gross monthly return series of the overlapping-sleeve momentum strategy.
+
+    Thin wrapper over :func:`momentum_backtest_detail` — the cost columns
+    default to zero, so this returns exactly what it always has.
     """
-    signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
-
-    returns = []
-    dates = []
-    for t in range(rank_lookback + skip_months, len(monthly_returns)):
-        sleeve_returns = []
-        for k in range(hold_period):
-            select_t = t - 1 - k
-            if select_t < rank_lookback - 1 + skip_months:
-                continue
-            ranking = signal.iloc[select_t].dropna()
-            if len(ranking) < top_n:
-                continue
-            picks = ranking.nlargest(top_n).index
-            r = monthly_returns.iloc[t][picks].dropna()
-            if len(r) > 0:
-                sleeve_returns.append(r.mean())
-        if sleeve_returns:
-            returns.append(np.mean(sleeve_returns))
-            dates.append(monthly_returns.index[t])
-
-    return pd.Series(
-        returns,
-        index=pd.DatetimeIndex(dates),
-        name=f"momentum_top{top_n}_hold{hold_period}",
+    detail = momentum_backtest_detail(
+        monthly_returns, top_n=top_n, hold_period=hold_period,
+        rank_lookback=rank_lookback, skip_months=skip_months,
     )
+    return detail["gross"].rename(f"momentum_top{top_n}_hold{hold_period}")
 
 
 def recent_picks(
@@ -463,6 +559,17 @@ def top_performers_period(
 _MONTH_DAYS = 30.4375
 
 
+def signal_window_days(rank_lookback: int, skip_months: int = 0) -> int:
+    """Calendar days of history :func:`current_target` reads, end to end.
+
+    ``top_performers_period`` takes the first bar at-or-after ``end - days`` with
+    no reach-back tolerance, so a frame shorter than this silently ranks on a
+    collapsed window instead of refusing. Callers that must not record a target
+    off a short window check the frame's span against this first.
+    """
+    return round(rank_lookback * _MONTH_DAYS) + round(skip_months * _MONTH_DAYS)
+
+
 def current_target(
     prices: pd.DataFrame,
     top_n: int,
@@ -621,6 +728,8 @@ def perf_stats(
     returns: pd.Series,
     periods_per_year: int = 12,
     risk_free_annual: float = 0.0,
+    turnover: pd.Series | None = None,
+    cost: pd.Series | None = None,
 ) -> dict:
     """Standard performance stats for a return series.
 
@@ -629,6 +738,17 @@ def perf_stats(
     (default 0). This matches `rolling_sharpe`; earlier versions divided CAGR by
     vol, which mixed a geometric numerator with an arithmetic denominator and
     silently assumed a zero risk-free rate.
+
+    Passing the ``turnover`` and ``cost`` columns of
+    :func:`momentum_backtest_detail` adds ``turnover_ann`` and ``cost_ann``.
+    Both drop the first observation, which is the initial funding buy rather than
+    a rebalance: including it would report the one-off cost of opening the book
+    as a recurring rate. Residual bias remains for long holds, where the first
+    ``hold_period`` months are still ramping sleeves up (roughly 6% of the
+    reported rate at h=6, 20% at h=12).
+
+    Keys are spread directly into the API's PERF rows and the CLI table, so a new
+    key here appears in both surfaces.
     """
     r = returns.dropna()
     cum = (1 + r).prod() - 1
@@ -639,13 +759,365 @@ def perf_stats(
     sharpe = (ann_mean - risk_free_annual) / vol if vol > 0 else 0
     equity = (1 + r).cumprod()
     drawdown = (equity / equity.cummax() - 1).min()
-    return {
+    out = {
         "total_return": cum,
         "CAGR": cagr,
         "vol": vol,
         "Sharpe": sharpe,
         "max_drawdown": drawdown,
         "months": len(r),
+    }
+    if turnover is not None:
+        rebalances = turnover.dropna().iloc[1:]
+        out["turnover_ann"] = (float(rebalances.mean() * periods_per_year)
+                               if len(rebalances) else None)
+    if cost is not None:
+        charged = cost.dropna().iloc[1:]
+        out["cost_ann"] = (float(charged.mean() * periods_per_year)
+                           if len(charged) else None)
+    return out
+
+
+# ---------- out-of-sample ledger: marking recorded targets to market ----------
+
+# Annualized stats stay suppressed below both bars. Annualizing 2 segments would
+# manufacture exactly the false confidence the ledger exists to remove.
+LEDGER_ANNUALIZE_MIN_DAYS = 365
+LEDGER_ANNUALIZE_MIN_SEGMENTS = 12
+
+
+def _jsonf(v) -> float | None:
+    """float, or None for anything not finite.
+
+    Starlette renders with ``allow_nan=False``, so a NaN or inf anywhere in a
+    response is an HTTP 500. None is the only honest substitute: 0.0 in an equity
+    curve is a wipeout that never happened.
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if np.isfinite(x) else None
+
+
+def _bar_at_or_before(index: pd.DatetimeIndex, ts: pd.Timestamp):
+    prior = index[index <= ts]
+    return prior[-1] if len(prior) else None
+
+
+def _recorded_price(entry: dict, ticker: str) -> float | None:
+    v = _jsonf((entry.get("entry_prices") or {}).get(ticker))
+    return v if v is not None and v > 0 else None
+
+
+def _empty_ledger_marks(reason: str) -> dict:
+    return {
+        "rows": [],
+        "equity": {"dates": [], "strategy": [], "benchmark": []},
+        "summary": {
+            "first_as_of": None, "priced_through": None,
+            "n_segments": 0, "n_completed": 0, "days_live": 0,
+            "total_return": None, "benchmark_total_return": None, "excess": None,
+            "equity_starts_at": None, "equity_segments": 0,
+            "equity_covers_all_segments": False,
+            "annualized": None, "annualized_blocked_reason": reason,
+        },
+    }
+
+
+def _mark_segment(entry: dict, s_ts, end_ts, frame: pd.DataFrame,
+                  idx: pd.DatetimeIndex, bench: pd.Series | None,
+                  is_open: bool) -> dict:
+    """One recorded cohort marked from bar ``s_ts`` to bar ``end_ts``."""
+    tickers = list(entry.get("tickers") or [])
+    # With no cached bar at or before as_of, the segment still has to start
+    # somewhere: the earliest bar the cache does hold, paired with the stored
+    # entry price as the basis.
+    window_start = s_ts if s_ts is not None else (idx[0] if len(idx) else None)
+
+    pick_returns: dict[str, float | None] = {}
+    priced: list[float] = []
+    frozen: list[str] = []
+    frozen_at: dict[str, str] = {}
+    unpriced: list[str] = []
+    unverified: list[str] = []
+    basis_ratio: dict[str, float] = {}
+    basis_shifted = False
+
+    for t in tickers:
+        col = frame[t] if t in frame.columns else None
+
+        start_val: float | None = None
+        from_cache = False
+        if col is not None and s_ts is not None and s_ts in col.index:
+            v = _jsonf(col.loc[s_ts])
+            if v is not None and v > 0:
+                start_val, from_cache = v, True
+        if start_val is None:
+            start_val = _recorded_price(entry, t)
+
+        # Audit the stored price against the current cached basis. The return
+        # itself always uses one consistent basis; this only labels the row.
+        if from_cache:
+            recorded = _recorded_price(entry, t)
+            if recorded is not None:
+                ratio = start_val / recorded
+                if ratio > SPLIT_JUMP_HI or ratio < SPLIT_JUMP_LO:
+                    basis_shifted = True
+                    basis_ratio[t] = round(ratio, 6)
+
+        end_val: float | None = None
+        at_ts = None
+        if col is not None and end_ts is not None and window_start is not None:
+            seg = col.loc[window_start:end_ts].dropna()
+            if len(seg):
+                end_val, at_ts = _jsonf(seg.iloc[-1]), seg.index[-1]
+
+        r = None
+        if start_val is not None and end_val is not None and start_val > 0:
+            r = _jsonf(end_val / start_val - 1)
+        if r is None:
+            pick_returns[t] = None
+            unpriced.append(t)
+            continue
+
+        if not from_cache:
+            unverified.append(t)
+        if at_ts is not None and end_ts is not None and at_ts < end_ts:
+            frozen.append(t)
+            frozen_at[t] = at_ts.strftime("%Y-%m-%d")
+        pick_returns[t] = r
+        priced.append(r)
+
+    # Equal dollars at s_k held without intra-segment rebalancing: the plain mean
+    # of the legs' ratios. Frozen legs stay in the denominator (dropping them
+    # would reweight the survivors up, which is the survivorship bias the ledger
+    # exists to escape); legs with no mark at all are excluded rather than
+    # counted as 0.
+    return_pct = _jsonf(np.mean(priced)) if priced else None
+
+    bench_return = None
+    if (bench is not None and s_ts is not None and end_ts is not None
+            and s_ts in bench.index and end_ts in bench.index):
+        b0, b1 = _jsonf(bench.loc[s_ts]), _jsonf(bench.loc[end_ts])
+        if b0 is not None and b1 is not None and b0 > 0:
+            bench_return = _jsonf(b1 / b0 - 1)
+
+    excess = (None if return_pct is None or bench_return is None
+              else _jsonf(return_pct - bench_return))
+
+    days_held = None
+    if end_ts is not None:
+        from_ts = s_ts if s_ts is not None else pd.Timestamp(entry["as_of"])
+        days_held = int((end_ts - from_ts).days)
+
+    return {
+        "as_of": entry["as_of"],
+        "end_date": end_ts.strftime("%Y-%m-%d") if end_ts is not None else None,
+        "start_date": s_ts.strftime("%Y-%m-%d") if s_ts is not None else None,
+        "is_open": is_open,
+        "benchmark": entry.get("benchmark"),
+        "tickers": tickers,
+        "pick_returns": pick_returns,
+        "return_pct": return_pct,
+        "bench_return_pct": bench_return,
+        # Difference of the two returns in the same fractional units; the UI
+        # renders it as percentage points.
+        "excess_pp": excess,
+        "n_priced": len(priced),
+        "n_frozen": len(frozen),
+        "frozen_tickers": frozen,
+        "frozen_at": frozen_at,
+        "unpriced_tickers": unpriced,
+        "basis_shifted": basis_shifted,
+        "basis_ratio": basis_ratio,
+        "basis_unverified": bool(unverified),
+        "basis_unverified_tickers": unverified,
+        "days_held": days_held,
+        "note": entry.get("note"),
+    }
+
+
+def _ledger_equity(ordered: list[dict], starts: list, ends: list,
+                   frame: pd.DataFrame) -> tuple[list, list[float], int]:
+    """Daily unit-equity curve chained across segments.
+
+    Built leg by leg with a forward fill inside each segment: a leg with an
+    interior gap (halt, bad Yahoo day) is carried at its last observed close, so
+    the array has no NaN and no hole. A chart cannot plot a hole, and NaN would
+    500 the response.
+
+    Only segments with a real cached start bar can be drawn, so the curve may
+    start later than the first entry and stop at the first hole. The row chain,
+    not this curve, is the authoritative total return.
+    """
+    dates: list = []
+    vals: list[float] = []
+    level = 1.0
+    covered = 0
+
+    for k, entry in enumerate(ordered):
+        s_ts, end_ts = starts[k], ends[k]
+        if s_ts is None or end_ts is None:
+            if dates:
+                break            # a hole after the curve started: stop there
+            continue             # entries older than the cache: nothing to draw
+        legs: dict[str, float] = {}
+        for t in (entry.get("tickers") or []):
+            if t in frame.columns and s_ts in frame.index:
+                v = _jsonf(frame[t].loc[s_ts])
+                if v is not None and v > 0:
+                    legs[t] = v
+        if not legs:
+            if dates:
+                break
+            continue
+
+        block = frame.loc[s_ts:end_ts, list(legs.keys())].ffill()
+        curve = level * (block / pd.Series(legs)).mean(axis=1)
+        if not dates:
+            dates.append(block.index[0])
+            vals.append(level)
+        for ts, v in zip(block.index[1:], curve.iloc[1:]):
+            f = _jsonf(v)
+            if f is None:
+                break
+            dates.append(ts)
+            vals.append(f)
+        level = vals[-1]
+        covered += 1
+
+    return dates, vals, covered
+
+
+def ledger_marks(
+    entries: list[dict],
+    prices: pd.DataFrame,
+    benchmark: str | None = None,
+    risk_free_annual: float = 0.0,
+) -> dict:
+    """Mark one params_hash group of recorded targets to market.
+
+    ``entries`` must all share a ``params_hash`` (the caller groups; mixing two
+    hashes would chain two different strategies into one curve). They are sorted
+    by ``as_of`` here, so a hand-edited out-of-order file still marks correctly.
+    ``prices`` is a daily adjusted-close frame including the benchmark column.
+
+    Segment ``k`` runs from the last cached bar at or before ``as_of_k`` to the
+    next entry's start bar, or to the last cached bar for the open segment.
+    Chaining at a shared close is the same zero-cost turnover assumption the
+    backtest makes.
+
+    Both endpoints come from the current cached series wherever possible, never a
+    mix of stored entry price and cached end price: ``auto_adjust`` rebases the
+    whole adjusted-close history on each fetch, so a split between recording and
+    marking would otherwise print a spurious -50%. Where the cache no longer
+    reaches ``as_of_k`` the stored price is the only basis available, and the row
+    says so via ``basis_unverified``.
+    """
+    if not entries:
+        return _empty_ledger_marks("no entries recorded yet")
+
+    hashes = {e.get("params_hash") for e in entries}
+    if len(hashes) > 1:
+        raise ValueError(
+            "ledger_marks expects entries from one params_hash, got "
+            f"{sorted(str(h) for h in hashes)}"
+        )
+
+    ordered = sorted(entries, key=lambda e: e.get("as_of") or "")
+    m = len(ordered)
+
+    frame = prices if prices is not None else pd.DataFrame()
+    if len(frame.index):
+        frame = frame.sort_index()
+    idx = frame.index if len(frame.index) else pd.DatetimeIndex([])
+    last_bar = idx[-1] if len(idx) else None
+    bench = frame[benchmark] if benchmark and benchmark in frame.columns else None
+
+    starts = [_bar_at_or_before(idx, pd.Timestamp(e["as_of"])) for e in ordered]
+    ends = [(starts[k + 1] if k + 1 < m else last_bar) for k in range(m)]
+
+    rows = [_mark_segment(ordered[k], starts[k], ends[k], frame, idx, bench,
+                          is_open=(k == m - 1))
+            for k in range(m)]
+
+    dates, vals, covered = _ledger_equity(ordered, starts, ends, frame)
+
+    bench_vals: list[float] = []
+    if bench is not None and dates:
+        b = bench.reindex(pd.DatetimeIndex(dates)).ffill()
+        b0 = _jsonf(b.iloc[0])
+        if b0 is not None and b0 > 0:
+            scaled = [_jsonf(v / b0) for v in b]
+            if all(v is not None for v in scaled):
+                bench_vals = scaled
+
+    def chain(key: str) -> float | None:
+        legs = [r[key] for r in rows if r[key] is not None]
+        if not legs:
+            return None
+        acc = 1.0
+        for r in legs:
+            acc *= (1.0 + r)
+        return _jsonf(acc - 1.0)
+
+    total = chain("return_pct")
+    bench_total = chain("bench_return_pct")
+    n_completed = sum(1 for r in rows if not r["is_open"] and r["return_pct"] is not None)
+    first_as_of = ordered[0]["as_of"]
+    days_live = 0
+    if last_bar is not None:
+        days_live = max(0, int((last_bar - pd.Timestamp(first_as_of)).days))
+
+    annualized = None
+    blocked: str | None = None
+    if days_live < LEDGER_ANNUALIZE_MIN_DAYS or n_completed < LEDGER_ANNUALIZE_MIN_SEGMENTS:
+        blocked = (
+            f"{n_completed} completed segment(s) over {days_live} days: "
+            f"needs {LEDGER_ANNUALIZE_MIN_SEGMENTS} completed segments and "
+            f"{LEDGER_ANNUALIZE_MIN_DAYS} days to annualize"
+        )
+    elif len(vals) < 3:
+        blocked = "equity curve covers too few bars to annualize"
+    else:
+        daily = pd.Series(vals, index=pd.DatetimeIndex(dates)).pct_change().dropna()
+        stats = perf_stats(daily, periods_per_year=252, risk_free_annual=risk_free_annual)
+        # Take 3 keys by hand: perf_stats also returns "months", which at
+        # periods_per_year=252 holds a trading-day count and would publish
+        # "months: 251".
+        annualized = {
+            "CAGR":   _jsonf(stats["CAGR"]),
+            "vol":    _jsonf(stats["vol"]),
+            "Sharpe": _jsonf(stats["Sharpe"]),
+        }
+
+    return {
+        "rows": rows[::-1],                       # newest first for the UI
+        "equity": {
+            "dates": [d.strftime("%Y-%m-%d") for d in dates],
+            "strategy": vals,
+            "benchmark": bench_vals,
+        },
+        "summary": {
+            "first_as_of": first_as_of,
+            "priced_through": (last_bar.strftime("%Y-%m-%d")
+                               if last_bar is not None else None),
+            "n_segments": m,
+            "n_completed": n_completed,
+            "days_live": days_live,
+            "total_return": total,
+            "benchmark_total_return": bench_total,
+            "excess": (None if total is None or bench_total is None
+                       else _jsonf(total - bench_total)),
+            "equity_starts_at": (dates[0].strftime("%Y-%m-%d") if dates else None),
+            "equity_segments": covered,
+            "equity_covers_all_segments": covered == m,
+            "annualized": annualized,
+            "annualized_blocked_reason": blocked,
+        },
     }
 
 

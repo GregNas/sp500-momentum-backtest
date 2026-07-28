@@ -122,6 +122,12 @@ function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                   theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
                   wrapStyle={{ marginBottom: 12 }} />
 
+        <NumField id="v1-cost" label="Cost (bps / side)" value={params.costBps}
+                  min={0} max={100} help={PARAM_HELP.costBps}
+                  onChange={v => setParam('costBps', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
+
         <NumField id="v1-horizon" label="Event horizon" value={params.horizon}
                   min={1} max={24} help={PARAM_HELP.horizon}
                   onChange={v => setParam('horizon', v)}
@@ -254,8 +260,9 @@ function V1EmptyState({ onRun, running, error, elapsed, status }) {
   );
 }
 
-function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
+function V1Dashboard({ params, ranParams, setParam, data, status, running, error, elapsed,
                        cacheInfo, cacheNotice, universes, onRun, onClearCache }) {
+  const recorder = useLedgerRecorder(ranParams, data && data.REBALANCE);
   const [hoverIdx, setHoverIdx] = useStateV1(null);
   const [pinnedIdx, setPinnedIdx] = useStateV1(null);
   const [logScale, setLogScale] = useStateV1(true);
@@ -555,7 +562,17 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
               background: v1Theme.card, border: `1px solid ${v1Theme.border}`,
               borderRadius: 8, padding: '14px 16px',
             }}>
-              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Performance</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between',
+                             alignItems: 'baseline', marginBottom: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>Performance</div>
+                <div style={{ fontSize: 10.5, color: v1Theme.muted,
+                               fontFamily: 'JetBrains Mono, monospace' }}>
+                  {data.COST_BPS > 0
+                    ? `net of ${data.COST_BPS} bps/side`
+                    : 'gross (no costs)'}
+                </div>
+              </div>
+              <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', fontSize: 12,
                               fontFamily: 'JetBrains Mono, monospace',
                               borderCollapse: 'collapse' }}>
@@ -572,6 +589,14 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                                   borderBottom: `1px solid ${v1Theme.border}` }}>Sharpe</th>
                     <th style={{ textAlign: 'right', padding: '6px 4px', fontWeight: 500,
                                   borderBottom: `1px solid ${v1Theme.border}` }}>Max DD</th>
+                    <th title="One-way turnover per year, excluding the initial build"
+                        style={{ textAlign: 'right', padding: '6px 4px', fontWeight: 500,
+                                  whiteSpace: 'nowrap',
+                                  borderBottom: `1px solid ${v1Theme.border}` }}>Turnover</th>
+                    <th title="CAGR given up to trading costs"
+                        style={{ textAlign: 'right', padding: '6px 4px', fontWeight: 500,
+                                  whiteSpace: 'nowrap',
+                                  borderBottom: `1px solid ${v1Theme.border}` }}>Cost drag</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -587,17 +612,30 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                           {isBest && <span style={{ color: v1Accent.dark, marginRight: 4 }}>●</span>}
                           {p.strategy}
                         </td>
-                        <td style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtPct(p.total_return, 0)}</td>
+                        <td title={p.gross_total_return != null
+                              ? `gross ${fmtPct(p.gross_total_return, 0)}` : undefined}
+                            style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtPct(p.total_return, 0)}</td>
                         <td style={{ padding: '7px 4px', textAlign: 'right' }}>{fmtPct(p.CAGR, 1, false)}</td>
-                        <td style={{ padding: '7px 4px', textAlign: 'right',
+                        <td title={p.gross_Sharpe != null
+                              ? `gross ${fmtNum(p.gross_Sharpe)}` : undefined}
+                            style={{ padding: '7px 4px', textAlign: 'right',
                                       fontWeight: isBest ? 600 : 400 }}>{fmtNum(p.Sharpe)}</td>
                         <td style={{ padding: '7px 4px', textAlign: 'right',
                                       color: '#b91c1c' }}>{fmtPct(p.max_drawdown, 1, false)}</td>
+                        <td style={{ padding: '7px 4px', textAlign: 'right',
+                                      color: v1Theme.muted }}>
+                          {p.turnover_ann == null ? '—' : `${(p.turnover_ann * 100).toFixed(0)}%`}
+                        </td>
+                        <td style={{ padding: '7px 4px', textAlign: 'right',
+                                      color: p.cost_drag ? '#b91c1c' : v1Theme.muted }}>
+                          {p.cost_drag == null ? '—' : `-${(p.cost_drag * 100).toFixed(2)}%`}
+                        </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
 
@@ -610,7 +648,16 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                           rankLookback={params.rankLookback}
                           skipMonths={params.skipMonths || 0}
                           universe={params.universe || 'sp500'}
-                          theme={v1Theme} accent={v1Accent} />
+                          theme={v1Theme} accent={v1Accent}
+                          onRecord={recorder.onRecord}
+                          recordState={recorder.recordState}
+                          recordMessage={recorder.recordMessage}
+                          recordedAsOf={recorder.recordedAsOf} />
+
+          {/* Realized out-of-sample record of the targets recorded above */}
+          <LedgerPanel theme={v1Theme} accent={v1Accent}
+                       benchmark={params.benchmark}
+                       reloadKey={recorder.ledgerVersion} />
 
           {/* Caveats */}
           <div style={{

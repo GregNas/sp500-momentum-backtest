@@ -27,10 +27,10 @@
 
 <!-- ?v bust: bump when a no-build asset changes so any heuristically-cached
      browser copy is replaced; the no-cache header keeps it fresh thereafter. -->
-<script src="data-loader.js?v=5"></script>
-<script type="text/babel" src="charts.jsx?v=5"></script>
-<script type="text/babel" src="v1.jsx?v=5"></script>
-<script type="text/babel" src="v2.jsx?v=5"></script>
+<script src="data-loader.js?v=7"></script>
+<script type="text/babel" src="charts.jsx?v=7"></script>
+<script type="text/babel" src="v1.jsx?v=7"></script>
+<script type="text/babel" src="v2.jsx?v=7"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -42,6 +42,7 @@ const DEFAULT_PARAMS = {
   universe: 'sp500',
   lookback: 5, topN: 10, holds: [1, 3, 6],
   rankLookback: 1, skipMonths: 0, horizon: 12, benchmark: 'SPY',
+  costBps: 10,    // bps charged per side of a trade; 0 shows gross returns
   riskFree: 0,   // annual risk-free rate (fraction) for Sharpe
 };
 
@@ -79,6 +80,10 @@ function VariationSwitcher({ variation, setVariation }) {
 
 function App() {
   const [params, setParams] = useState(DEFAULT_PARAMS);
+  // The params the displayed run actually used. Both dashboards pass the live
+  // `params` into their panels, so recording off that would file a cohort under
+  // sidebar values the user typed but never executed.
+  const [ranParams, setRanParams] = useState(null);
   const [data, setData] = useState(null);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState(null);
@@ -128,6 +133,7 @@ function App() {
       const result = await runBacktest(params, setProgressMsg);
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       setData(result);
+      setRanParams({ ...params });
       const cacheStatus = (result.status_messages || []).some(m => m.toLowerCase().includes('cache hit'))
         ? 'cache hit' : 'fresh data';
       setStatus(`${cacheStatus} · ${elapsed}s`);
@@ -158,7 +164,7 @@ function App() {
     : status;
 
   const dashProps = {
-    params, setParam,
+    params, ranParams, setParam,
     data, status: displayStatus, running, error, elapsed,
     cacheInfo, cacheNotice, universes, onRun, onClearCache,
   };

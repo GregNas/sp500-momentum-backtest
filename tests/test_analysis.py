@@ -91,6 +91,88 @@ def test_event_study_summary_structure():
                - (summ.loc[1, "avg_return"] - bench.mean())) < 1e-12
 
 
+# ---- turnover and transaction costs ----
+
+def _alternating_frame():
+    """2 tickers whose prior-month winner flips every month, so a top-1 book is
+    fully replaced at every rebalance and the turnover is hand-computable."""
+    idx = _months(6)
+    a = [0.10, -0.10, 0.10, -0.10, 0.10, -0.10]
+    return pd.DataFrame({"A": a, "B": [-x for x in a]}, index=idx)
+
+
+def test_cost_bps_zero_reproduces_legacy_backtest():
+    r = _monthly_frame(n_months=30)
+    for hold in (1, 3, 6):
+        detail = analysis.momentum_backtest_detail(
+            r, top_n=3, hold_period=hold, rank_lookback=2, cost_bps=0.0)
+        legacy = analysis.momentum_backtest(r, top_n=3, hold_period=hold, rank_lookback=2)
+        assert np.allclose(detail["gross"].values, legacy.values)
+        # No cost charged means net is the same series, not merely close.
+        assert detail["net"].equals(detail["gross"])
+        assert (detail["cost"] == 0).all()
+
+
+def test_turnover_is_one_when_book_fully_replaced():
+    r = _alternating_frame()
+    d = analysis.momentum_backtest_detail(r, top_n=1, hold_period=1, rank_lookback=1)
+    # First row is the funding buy: one side only, so trade 1.0 -> turnover 0.5.
+    assert abs(d["trade"].iloc[0] - 1.0) < 1e-12
+    assert abs(d["turnover"].iloc[0] - 0.5) < 1e-12
+    # Every later month swaps the single holding: sell 100% + buy 100%.
+    assert np.allclose(d["trade"].iloc[1:].values, 2.0)
+    assert np.allclose(d["turnover"].iloc[1:].values, 1.0)
+
+
+def test_weights_sum_to_one_when_a_pick_has_no_bar():
+    # 4 tickers, top 3, but one pick is NaN in the month it would be held: the
+    # sleeve equal-weights the 2 names it actually holds, so cost must not bill
+    # notional that was never held.
+    idx = _months(4)
+    r = pd.DataFrame({
+        "A": [0.20, 0.01, 0.01, 0.01],
+        "B": [0.15, 0.01, 0.01, 0.01],
+        "C": [0.10, np.nan, 0.01, 0.01],
+        "D": [-0.50, 0.01, 0.01, 0.01],
+    }, index=idx)
+    d = analysis.momentum_backtest_detail(r, top_n=3, hold_period=1, rank_lookback=1)
+    # Month 1 holds A and B only (C has no bar). The opening trade is the funding
+    # buy of a book that sums to exactly 1.
+    assert abs(d["trade"].iloc[0] - 1.0) < 1e-12
+
+
+def test_cost_scales_linearly_with_bps():
+    r = _monthly_frame(n_months=24)
+    base = analysis.momentum_backtest_detail(r, top_n=3, hold_period=1, rank_lookback=1,
+                                             cost_bps=10.0)
+    twice = analysis.momentum_backtest_detail(r, top_n=3, hold_period=1, rank_lookback=1,
+                                              cost_bps=20.0)
+    assert np.allclose(twice["cost"].values, 2 * base["cost"].values)
+    assert np.allclose(twice["gross"].values, base["gross"].values)
+    assert np.allclose(twice["net"].values, base["gross"].values - twice["cost"].values)
+
+
+def test_perf_stats_turnover_and_cost_exclude_the_opening_buy():
+    r = _alternating_frame()
+    d = analysis.momentum_backtest_detail(r, top_n=1, hold_period=1, rank_lookback=1,
+                                          cost_bps=10.0)
+    s = analysis.perf_stats(d["net"], turnover=d["turnover"], cost=d["cost"])
+    # Rebalance months all have turnover 1.0, so the annualized rate is 12x that.
+    assert abs(s["turnover_ann"] - 12.0) < 1e-12
+    # 10 bps on both sides of a full replacement is 20 bps a month.
+    assert abs(s["cost_ann"] - 0.0020 * 12) < 1e-12
+    # Without the series the keys stay absent, so existing callers are unchanged.
+    assert "turnover_ann" not in analysis.perf_stats(d["net"])
+
+
+def test_perf_stats_turnover_none_when_only_the_opening_month_exists():
+    d = pd.DataFrame({"turnover": [0.5], "cost": [0.001]},
+                     index=_months(1))
+    s = analysis.perf_stats(pd.Series([0.01], index=_months(1)),
+                            turnover=d["turnover"], cost=d["cost"])
+    assert s["turnover_ann"] is None and s["cost_ann"] is None
+
+
 # ---- time-aligned event-study alpha ----
 
 def test_event_study_summary_aligned_alpha_and_win_rate():

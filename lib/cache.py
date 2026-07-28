@@ -41,17 +41,33 @@ SPLIT_JUMP_LO = 0.72
 
 # ---------- tickers ----------
 
-def load_tickers() -> list[str] | None:
+def load_tickers(stale_ok: bool = False) -> list[str] | None:
+    """Cached membership list, or None past the TTL.
+
+    ``stale_ok=True`` ignores the TTL and returns whatever is on disk. That is
+    the airgap fallback: a list scraped weeks ago is a small, disclosable drift
+    in what the strategy ranks, whereas a failed Wikipedia call with a perfectly
+    usable price cache on disk is an outage. The default reproduces the previous
+    behaviour exactly.
+    """
     if not TICKERS_JSON.exists():
         return None
     try:
         blob = json.loads(TICKERS_JSON.read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    fetched = datetime.fromisoformat(blob["fetched_at"])
+    tickers = blob.get("tickers")
+    if not tickers:
+        return None
+    if stale_ok:
+        return tickers
+    try:
+        fetched = datetime.fromisoformat(blob["fetched_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
     if datetime.now(timezone.utc) - fetched > timedelta(hours=TICKERS_TTL_HOURS):
         return None
-    return blob["tickers"]
+    return tickers
 
 
 def save_tickers(tickers: list[str]) -> None:
@@ -96,7 +112,7 @@ def _load_meta() -> dict | None:
         return None
 
 
-def _atomic_write(dest: Path, write: Callable[[Path], None]) -> None:
+def atomic_write(dest: Path, write: Callable[[Path], None]) -> None:
     """Write via a temp file in the same directory, then atomically replace
     ``dest``. A crash, a full disk, or a second process writing concurrently can
     then only ever leave ``dest`` as the complete old file or the complete new
@@ -115,17 +131,22 @@ def _atomic_write(dest: Path, write: Callable[[Path], None]) -> None:
             tmp.unlink()
 
 
+# Public since the ledger writes through it too; the private name stays as an
+# alias so no existing call site or test moves.
+_atomic_write = atomic_write
+
+
 def _save(prices: pd.DataFrame) -> None:
     CACHE_DIR.mkdir(exist_ok=True)
     prices = prices.sort_index()
-    _atomic_write(PRICES_PARQUET, prices.to_parquet)
+    atomic_write(PRICES_PARQUET, prices.to_parquet)
     meta = json.dumps({
         "start": prices.index.min().strftime("%Y-%m-%d"),
         "end": prices.index.max().strftime("%Y-%m-%d"),
         "tickers": sorted(prices.columns.tolist()),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     })
-    _atomic_write(PRICES_META, lambda p: p.write_text(meta))
+    atomic_write(PRICES_META, lambda p: p.write_text(meta))
 
 
 def clear() -> None:
@@ -151,6 +172,61 @@ def coverage() -> dict | None:
         out["age_hours"] = round(age.total_seconds() / 3600, 1)
         out["is_fresh"] = age < timedelta(hours=TAIL_FRESH_HOURS)
     return out
+
+
+def _parquet_columns() -> list[str] | None:
+    """Column names in the cached parquet without reading its data, or None if
+    the footer can't be read (then the caller reads the whole frame instead)."""
+    try:
+        import pyarrow.parquet as pq
+        return list(pq.read_schema(PRICES_PARQUET).names)
+    except Exception:
+        return None
+
+
+def load_prices(
+    tickers: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame | None:
+    """Read the price cache from disk. Never fetches, never writes.
+
+    Returns None when there is no readable cache, so a caller can tell "no data
+    on disk" from "on disk but nothing matched". ``None`` defaults are resolved
+    here (all columns, the frame's own date span) because :func:`_slice` cannot
+    take them: it indexes ``tickers`` and slices ``.loc[start:end]`` directly.
+
+    Two things callers must know about the result. ``_slice`` drops all-NaN
+    columns, so a ticker that is cached but has no bar inside the window comes
+    back *absent* rather than all-NaN — a missing column is not proof it was
+    never cached (use :func:`coverage` for that). And the parquet is one shared
+    table across all 3 universes plus every benchmark ever requested, so any
+    caller that *ranks* off this frame must narrow the columns to the universe
+    it means itself; this function has no idea what a universe is.
+    """
+    if not PRICES_PARQUET.exists():
+        return None
+
+    want: list[str] | None = None
+    if tickers is not None:
+        available = _parquet_columns()
+        if available is not None:
+            want = [t for t in tickers if t in available]
+            if not want:
+                return pd.DataFrame()      # cache exists, holds none of these
+    try:
+        frame = pd.read_parquet(PRICES_PARQUET, columns=want)
+    except Exception:
+        return None
+    if frame.empty:
+        return None
+    frame = frame.sort_index()
+
+    cols = (list(frame.columns) if tickers is None
+            else [t for t in tickers if t in frame.columns])
+    start_ts = pd.Timestamp(start) if start else frame.index.min()
+    end_ts = pd.Timestamp(end) if end else frame.index.max()
+    return _slice(frame, start_ts, end_ts, cols)
 
 
 def get_prices_cached(

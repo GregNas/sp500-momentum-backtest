@@ -142,6 +142,11 @@ function V2Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                 onChange={v => setParam('skipMonths', v)}
                 theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
 
+      <NumField id="v2-cost" label="Cost (bps / side)" value={params.costBps}
+                min={0} max={100} help={PARAM_HELP.costBps}
+                onChange={v => setParam('costBps', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+
       <NumField id="v2-horizon" label="Event horizon" value={params.horizon}
                 min={1} max={24} help={PARAM_HELP.horizon}
                 onChange={v => setParam('horizon', v)}
@@ -244,8 +249,9 @@ function V2EmptyState({ onRun, running, error, elapsed, status }) {
   );
 }
 
-function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
+function V2Dashboard({ params, ranParams, setParam, data, status, running, error, elapsed,
                        cacheInfo, cacheNotice, universes, onRun, onClearCache }) {
+  const recorder = useLedgerRecorder(ranParams, data && data.REBALANCE);
   const [hoverIdx, setHoverIdx] = useStateV2(null);
   const [pinnedIdx, setPinnedIdx] = useStateV2(null);
   const [logScale, setLogScale] = useStateV2(true);
@@ -741,7 +747,17 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                           skipMonths={params.skipMonths || 0}
                           universe={params.universe || 'sp500'}
                           theme={v2Theme} accent={v2Accent}
-                          headingFont='"Source Serif Pro", Georgia, serif' />
+                          headingFont='"Source Serif Pro", Georgia, serif'
+                          onRecord={recorder.onRecord}
+                          recordState={recorder.recordState}
+                          recordMessage={recorder.recordMessage}
+                          recordedAsOf={recorder.recordedAsOf} />
+
+          {/* Realized out-of-sample record of the targets recorded above */}
+          <LedgerPanel theme={v2Theme} accent={v2Accent}
+                       headingFont='"Source Serif Pro", Georgia, serif'
+                       benchmark={params.benchmark}
+                       reloadKey={recorder.ledgerVersion} />
 
           {/* Rolling Sharpe + Underwater (two-up) */}
           <div style={{ display: 'grid',

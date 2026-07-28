@@ -6,21 +6,22 @@ Run:
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from lib import analysis, cache, data, universes
+from lib import analysis, cache, data, ledger, universes
 
 UniverseKey = Literal["sp500", "global_etfs", "us_sector_etfs"]
 
@@ -45,6 +46,9 @@ class BacktestParams(BaseModel):
     horizon: int = Field(12, ge=1, le=24)
     benchmark: str = "SPY"
     riskFree: float = Field(0.0, ge=0.0, le=0.2)  # annual risk-free rate for Sharpe
+    # Trading cost in basis points charged on each side of a trade. Replacing the
+    # whole book bills 2x this. costBps=0 reproduces the pre-cost numbers exactly.
+    costBps: float = Field(10.0, ge=0.0, le=100.0)
     runId: Optional[str] = None
 
 
@@ -52,6 +56,20 @@ class TopPerformersParams(BaseModel):
     universe: UniverseKey = "sp500"
     topN: int = Field(10, ge=1, le=100)
     days: int = Field(30, ge=1, le=365)
+    runId: Optional[str] = None
+
+
+class LedgerRecordParams(BaseModel):
+    universe: UniverseKey = "sp500"
+    topN: int = Field(10, ge=1, le=100)
+    rankLookback: int = Field(1, ge=1, le=12)
+    skipMonths: int = Field(0, ge=0, le=2)
+    benchmark: str = "SPY"
+    note: Optional[str] = Field(None, max_length=280)
+    # What the browser had on screen, checked against the recomputed bar so a
+    # stale tab can be told it recorded a different day than it displayed. The
+    # cohort itself is never taken from the client.
+    displayedAsOf: Optional[str] = None
     runId: Optional[str] = None
 
 
@@ -288,13 +306,21 @@ def _run_backtest(params: BacktestParams) -> dict:
     summary = analysis.event_study_summary(events, benchmark_monthly)
 
     # ---- Strategy backtests ----
+    # Net of trading costs is the headline series, because that is what the
+    # strategy would actually have cleared; gross is carried alongside so the
+    # cost can be seen rather than assumed. costBps=0 makes the two identical.
+    detail: dict[int, pd.DataFrame] = {}
     strategy_returns: dict[int, pd.Series] = {}
+    gross_returns: dict[int, pd.Series] = {}
+    signal = analysis.momentum_signal(monthly, params.rankLookback, params.skipMonths)
     for h in params.holds:
-        r = analysis.momentum_backtest(
+        d = analysis.momentum_backtest_detail(
             monthly, top_n=params.topN, hold_period=h, rank_lookback=params.rankLookback,
-            skip_months=params.skipMonths,
+            skip_months=params.skipMonths, cost_bps=params.costBps, signal=signal,
         )
-        strategy_returns[h] = r
+        detail[h] = d
+        strategy_returns[h] = d["net"]
+        gross_returns[h] = d["gross"]
 
     if not strategy_returns or all(s.empty for s in strategy_returns.values()):
         raise HTTPException(
@@ -318,26 +344,42 @@ def _run_backtest(params: BacktestParams) -> dict:
     months_iso = [d.strftime("%Y-%m-%d") for d in first_returns.index]
 
     equity = {"months": months_iso}
+    equity_gross = {"months": months_iso}
     drawdown = {}
     monthly_returns_out = {}
+    turnover_out = {"months": months_iso}
     for h, r in strategy_returns.items():
         eq = (1 + r.fillna(0)).cumprod()
         equity[f"h{h}m"] = _safe_floats(eq)
+        equity_gross[f"h{h}m"] = _safe_floats((1 + gross_returns[h].fillna(0)).cumprod())
         drawdown[f"h{h}m"] = _drawdown(r)
         monthly_returns_out[f"h{h}m"] = _safe_floats(r)
+        turnover_out[f"h{h}m"] = _safe_floats(detail[h]["turnover"])
 
     bench_eq = (1 + bench_aligned).cumprod()
     equity["spy"] = _safe_floats(bench_eq)
+    equity_gross["spy"] = _safe_floats(bench_eq)   # no trading, so gross == net
     drawdown["spy"] = _drawdown(bench_aligned)
     monthly_returns_out["spy"] = _safe_floats(bench_aligned)
 
     perf_rows = []
     for h, r in strategy_returns.items():
-        s = analysis.perf_stats(r, risk_free_annual=params.riskFree)
+        d = detail[h]
+        s = analysis.perf_stats(
+            r, risk_free_annual=params.riskFree,
+            turnover=d["turnover"], cost=d["cost"],
+        )
+        g = analysis.perf_stats(gross_returns[h], risk_free_annual=params.riskFree)
         perf_rows.append({
             "strategy": f"top{params.topN}_hold{h}m",
             **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
                for k, v in s.items()},
+            # Gross counterparts, so the UI can show what the costs took.
+            "gross_total_return": float(g["total_return"]),
+            "gross_CAGR": float(g["CAGR"]),
+            "gross_Sharpe": float(g["Sharpe"]),
+            "gross_max_drawdown": float(g["max_drawdown"]),
+            "cost_drag": float(g["CAGR"] - s["CAGR"]),
         })
     bench_stats = analysis.perf_stats(bench_aligned, risk_free_annual=params.riskFree)
     perf_rows.append({
@@ -408,6 +450,13 @@ def _run_backtest(params: BacktestParams) -> dict:
     for r in rebalance:
         tickers_in_row = set(r["buys"]) | set(r["sells"]) | set(r["holds"])
         r["meta"] = {t: sector_map.get(t, "") for t in tickers_in_row}
+        # What this single rebalance costs. In an equal-weight top-N book each
+        # name carries 1/N, so selling S and buying B trades (B+S)/N of notional
+        # and is billed costBps on each side of it.
+        if params.topN > 0:
+            traded = (len(r["buys"]) + len(r["sells"])) / params.topN
+            r["turnover"] = traded / 2.0
+            r["cost_pct"] = params.costBps / 10000.0 * traded
 
     # ---- Calendar-year (year-over-year) returns per strategy + benchmark ----
     yearly_returns_out: dict = {}
@@ -419,6 +468,9 @@ def _run_backtest(params: BacktestParams) -> dict:
         "PERF": perf_rows,
         "EVENT_STUDY": event_study_rows,
         "EQUITY": equity,
+        "EQUITY_GROSS": equity_gross,
+        "TURNOVER": turnover_out,
+        "COST_BPS": float(params.costBps),
         "DRAWDOWN": drawdown,
         "MONTHLY_RETURNS": monthly_returns_out,
         "YEARLY_RETURNS": yearly_returns_out,
@@ -559,6 +611,7 @@ def universe_info() -> dict:
             "topN": {"min": 1, "max": 100},
             "rankLookback": {"min": 1, "max": 12},
             "skipMonths": {"min": 0, "max": 2},
+            "costBps": {"min": 0, "max": 100},
             "horizon": {"min": 1, "max": 24},
         },
         "universes": {},
@@ -604,6 +657,392 @@ def cache_info() -> Optional[dict]:
 def clear_cache() -> dict:
     cache.clear()
     return {"ok": True}
+
+
+# ---- out-of-sample ledger ----
+
+# Recording prefers the price cache; it only fetches when the cache is missing or
+# its last bar is older than this. Record is clicked right after a run, so the
+# cache path is the normal one and the click never triggers a 500-ticker download.
+LEDGER_CACHE_STALE_DAYS = 5
+
+# Matches the shortest allowed backtest pull (lookback=1), so a record-triggered
+# fetch warms exactly the cache a backtest would and still covers the widest
+# ranking window (426 days at rankLookback=12 plus skipMonths=2).
+LEDGER_FETCH_DAYS = 455
+
+LEDGER_MAX_WARNINGS = 12
+
+_UNIVERSE_SOURCE_WARNING = {
+    "stale_cache": (
+        "Universe list came from the stale on-disk cache (the membership scrape "
+        "failed), so it may be weeks out of date."
+    ),
+    "price_cache_columns": (
+        "Universe list was reconstructed from the price cache's own columns (no "
+        "scrape and no cached membership file), so it is whatever was last "
+        "downloaded rather than today's index."
+    ),
+}
+
+
+def _assert_json_clean(payload: dict, what: str) -> dict:
+    """Fail loudly here rather than as an opaque 500 from Starlette's renderer,
+    which dumps with allow_nan=False and rejects any NaN or inf in the tree."""
+    try:
+        json.dumps(payload, allow_nan=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"{what} payload is not JSON-clean: {exc}")
+    return payload
+
+
+def _record_universe(key: str, benchmark: str, cached_columns) -> Tuple[List[str], str]:
+    """(tickers, source) for the record path, without letting a scrape outage win.
+
+    ``get_sp500_tickers`` returns the disk cache only inside its 24h TTL and
+    scrapes Wikipedia after that, so on an airgapped box the first Record click a
+    day after the last successful scrape would 502 with a perfectly usable price
+    cache sitting right there. Each fallback is recorded on the entry, because a
+    3-month-stale membership list is a real (if small) drift in what was ranked.
+    ``cached_columns`` is a callable so the full-parquet read only happens on that
+    last-resort path.
+    """
+    if key != "sp500":
+        try:
+            tickers, _meta = data.get_universe(key)   # module constants, no network
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return tickers, "hardcoded"
+
+    try:
+        return data.get_sp500_tickers(), "wikipedia"
+    except Exception:
+        pass
+    stale = cache.load_tickers(stale_ok=True)
+    if stale:
+        return stale, "stale_cache"
+    columns = [c for c in (cached_columns() or []) if c != benchmark]
+    if columns:
+        return columns, "price_cache_columns"
+    raise HTTPException(
+        status_code=502,
+        detail=("Universe unavailable: the membership scrape failed and there is no "
+                "cached ticker list or price cache to fall back on."),
+    )
+
+
+def _ledger_label(entry: dict) -> str:
+    p = entry.get("params") or {}
+    parts = [
+        universes.UNIVERSE_LABEL.get(p.get("universe"), str(p.get("universe"))),
+        f"top {p.get('topN')}",
+        f"{p.get('rankLookback')}m rank",
+    ]
+    if p.get("skipMonths"):
+        parts.append(f"skip {p['skipMonths']}m")
+    return " · ".join(parts)
+
+
+@app.post("/api/ledger/record")
+def record_ledger_target(params: LedgerRecordParams) -> dict:
+    try:
+        return _record_ledger_target(params)
+    finally:
+        if params.runId:
+            PROGRESS.pop(params.runId, None)
+
+
+def _record_ledger_target(params: LedgerRecordParams) -> dict:
+    """Recompute the live target server-side and append it to the ledger.
+
+    The client supplies settings only, never tickers or prices, so a stale tab
+    cannot inject a cohort into the record.
+    """
+    status_messages: list[str] = []
+    def on_status(msg: str) -> None:
+        status_messages.append(msg)
+        if params.runId:
+            PROGRESS.setdefault(params.runId, []).append(msg)
+
+    warnings: list[str] = []
+
+    def cached_columns() -> List[str]:
+        frame = cache.load_prices()
+        return list(frame.columns) if frame is not None else []
+
+    universe_tickers, universe_source = _record_universe(
+        params.universe, params.benchmark, cached_columns)
+    if universe_source in _UNIVERSE_SOURCE_WARNING:
+        warnings.append(_UNIVERSE_SOURCE_WARNING[universe_source])
+        on_status(_UNIVERSE_SOURCE_WARNING[universe_source])
+
+    # Same guard /api/backtest applies: without it a topN=50 record against an
+    # 11-name universe would store an 11-ticker cohort under a hash claiming 50,
+    # and two entries under one hash could hold different-length cohorts.
+    if params.topN >= len(universe_tickers):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"topN={params.topN} exceeds universe size ({len(universe_tickers)}) "
+                f"for {params.universe!r}. Try topN ≤ {len(universe_tickers) - 1}."
+            ),
+        )
+
+    wanted = universe_tickers + [params.benchmark]
+    frame = cache.load_prices(wanted)
+    price_source = "cache"
+    stale = True
+    if frame is not None and not frame.empty:
+        age = (pd.Timestamp(datetime.today().date()) - frame.index.max()).days
+        stale = age > LEDGER_CACHE_STALE_DAYS
+    if frame is None or frame.empty or stale:
+        end = datetime.today()
+        start = end - timedelta(days=LEDGER_FETCH_DAYS)
+        try:
+            frame = data.get_prices(wanted, start.strftime("%Y-%m-%d"),
+                                    end.strftime("%Y-%m-%d"), on_status=on_status)
+            price_source = "fetched"
+        except Exception as exc:
+            if frame is None or frame.empty:
+                raise HTTPException(status_code=502,
+                                    detail=f"Price fetch failed and the cache is empty: {exc}")
+            warnings.append(
+                f"Price refresh failed ({exc}); recorded off the cached prices "
+                f"through {frame.index.max():%Y-%m-%d}."
+            )
+            price_source = "cache (refresh failed)"
+
+    # I1: the parquet is one shared table across all 3 universes plus every
+    # benchmark ever requested, so narrow to this universe and drop the benchmark
+    # before ranking — exactly what _run_backtest does before live_rebalance.
+    # Handing the raw frame to current_target would let SPY into the top N and
+    # rank an 11-name sector run over 504 S&P names.
+    cols = [t for t in universe_tickers
+            if t in frame.columns and t != params.benchmark]
+    if not cols:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"No prices on hand for the {params.universe!r} universe. "
+                    f"Run a backtest first."),
+        )
+    constituents = frame[cols]
+
+    # top_performers_period has no reach-back tolerance: a frame shorter than the
+    # ranking window silently collapses to a shorter one and a different top N.
+    need_days = analysis.signal_window_days(params.rankLookback, params.skipMonths)
+    span = int((constituents.index.max() - constituents.index.min()).days)
+    if span < need_days:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Price cache covers {span} days, this signal needs {need_days}: "
+                    f"run a backtest first."),
+        )
+
+    target = analysis.current_target(
+        constituents, top_n=params.topN,
+        rank_lookback=params.rankLookback, skip_months=params.skipMonths,
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Not enough price history to form a target: run a backtest first.",
+        )
+    if len(target["tickers"]) < params.topN:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Only {len(target['tickers'])} of {params.topN} names have prices "
+                    f"in this window; recording a short cohort would break the hash. "
+                    f"Run a backtest first."),
+        )
+
+    as_of_ts = pd.Timestamp(target["as_of"])
+    entry_prices: dict[str, float | None] = {}
+    entry_unpriced: list[str] = []
+    at_as_of = (constituents.loc[as_of_ts]
+                if as_of_ts in constituents.index else None)
+    for t in target["tickers"]:
+        v = None if at_as_of is None else at_as_of.get(t)
+        # None, never NaN: a NaN here would 500 the response, and copying the
+        # signal_end price would pass off an older bar as the as_of price.
+        price = None if v is None or pd.isna(v) else float(v)
+        entry_prices[t] = price
+        if price is None:
+            entry_unpriced.append(t)
+
+    # The benchmark column can lag the constituents (a NaN on the as_of bar is
+    # normal), and scoring is locked to the benchmark recorded here, so taking
+    # only the as_of bar would leave the entry permanently unscoreable. Fall back
+    # to the benchmark's own last valid close at or before as_of and record which
+    # date it came from, rather than silently passing it off as the as_of price.
+    bench_price = None
+    bench_price_date = None
+    if params.benchmark in frame.columns:
+        bench_col = frame[params.benchmark].loc[:as_of_ts].dropna()
+        if len(bench_col):
+            bench_price = float(bench_col.iloc[-1])
+            bench_price_date = bench_col.index[-1].strftime("%Y-%m-%d")
+
+    entry_params = {
+        "universe": params.universe,
+        "topN": params.topN,
+        "rankLookback": params.rankLookback,
+        "skipMonths": params.skipMonths,
+    }
+    entry = {
+        "params_hash": ledger.params_hash(entry_params),
+        "signal_version": ledger.SIGNAL_VERSION,
+        "params": entry_params,
+        "benchmark": params.benchmark,
+        "as_of": target["as_of"],
+        "signal_end": target["signal_end"],
+        "window_start": target["start_date"],
+        "days": target["days"],
+        "recorded_at": (datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds").replace("+00:00", "Z")),
+        "tickers": target["tickers"],
+        "entry_prices": entry_prices,
+        "entry_unpriced": entry_unpriced,
+        "benchmark_entry_price": bench_price,
+        "benchmark_entry_date": bench_price_date,
+        "universe_source": universe_source,
+        "note": params.note,
+    }
+
+    try:
+        stored, created = ledger.append(entry)
+    except ledger.LedgerConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write the ledger: {exc}")
+
+    reason = None
+    if not created:
+        reason = ("already_recorded" if stored.get("as_of") == target["as_of"]
+                  else "already_recorded_this_month")
+
+    return _assert_json_clean({
+        "created": created,
+        "entry": stored,
+        "reason": reason,
+        "as_of": target["as_of"],
+        # "Same bar, same settings" does not guarantee "same cohort": a split heal
+        # between two clicks rebases a whole adjusted-close history and can
+        # reorder the ranking on an unchanged bar. The stored entry is never
+        # rewritten — it is what was recommended at the time — so the UI says the
+        # stored cohort differs rather than showing a bare "Recorded".
+        "target_matches_stored":
+            list(stored.get("tickers") or []) == target["tickers"],
+        "displayed_as_of_matches":
+            params.displayedAsOf is None or params.displayedAsOf == target["as_of"],
+        "universe_source": universe_source,
+        "price_source": price_source,
+        "warnings": warnings,
+        "status_messages": status_messages,
+    }, "ledger record")
+
+
+@app.get("/api/ledger")
+def ledger_history(
+    params_hash: Optional[str] = Query(None, alias="hash"),
+    refresh: int = Query(0, ge=0, le=1),
+) -> dict:
+    """Recorded targets marked to market, grouped by params_hash.
+
+    Disk-only by default (``cache.load_prices``), so the panel renders airgapped.
+    ``refresh=1`` is the one path that touches the network and is scoped to the
+    recorded ticker union (tens of names, not 500); a failure degrades to the
+    cache-only result plus a warning.
+
+    Scoring is locked to the benchmark recorded with each group. There is no
+    read-time override: re-scoring an existing record against a different
+    benchmark would allow benchmark shopping after the fact.
+    """
+    entries = ledger.load()
+    if not entries:
+        return {"entries_total": 0, "groups": [], "price_source": "cache",
+                "cache_coverage": cache.coverage(), "warnings": []}
+
+    grouped: dict[str, list[dict]] = {}
+    for e in entries:
+        grouped.setdefault(e.get("params_hash") or "unknown", []).append(e)
+    if params_hash:
+        grouped = {k: v for k, v in grouped.items() if k == params_hash}
+
+    wanted: list[str] = []
+    for group in grouped.values():
+        for e in group:
+            for t in list(e.get("tickers") or []) + [e.get("benchmark")]:
+                if t and t not in wanted:
+                    wanted.append(t)
+
+    warnings: list[str] = []
+    prices = cache.load_prices(wanted)
+    price_source = "cache"
+    if refresh and wanted:
+        first = min((e.get("as_of") or "9999-12-31")
+                    for group in grouped.values() for e in group)
+        start = min(pd.Timestamp(first) - pd.Timedelta(days=10),
+                    pd.Timestamp(datetime.today().date())
+                    - pd.Timedelta(days=LEDGER_FETCH_DAYS))
+        try:
+            prices = data.get_prices(wanted, start.strftime("%Y-%m-%d"),
+                                     datetime.today().strftime("%Y-%m-%d"))
+            price_source = "refreshed"
+        except Exception as exc:
+            warnings.append(f"Price refresh failed ({exc}); showing cached prices.")
+            price_source = "cache (refresh failed)"
+    if prices is None:
+        prices = pd.DataFrame()
+        warnings.append("No price cache on disk, so nothing can be marked to "
+                        "market yet. Run a backtest first.")
+
+    groups: list[dict] = []
+    frozen_seen: set[tuple] = set()
+    for h, group in grouped.items():
+        ordered = sorted(group, key=lambda e: e.get("as_of") or "")
+        newest = ordered[-1]
+        bench = newest.get("benchmark")
+        recorded_benchmarks = sorted({e.get("benchmark") for e in ordered
+                                      if e.get("benchmark")})
+        if len(recorded_benchmarks) > 1:
+            warnings.append(
+                f"{_ledger_label(newest)}: entries were recorded against "
+                f"{', '.join(recorded_benchmarks)}; the curve is scored against "
+                f"{bench} (each row reports its own)."
+            )
+        marks = analysis.ledger_marks(ordered, prices, benchmark=bench)
+        for row in marks["rows"]:
+            for t in row["frozen_tickers"]:
+                key = (t, row["frozen_at"].get(t))
+                if key in frozen_seen:
+                    continue
+                frozen_seen.add(key)
+                warnings.append(f"{t} has no bars after {key[1]}; frozen at its "
+                                f"last close in the equal-weight denominator.")
+        groups.append({
+            "params_hash": h,
+            "params": newest.get("params") or {},
+            "signal_version": newest.get("signal_version"),
+            "label": _ledger_label(newest),
+            "benchmark": bench,
+            "universe_sources": sorted({e.get("universe_source") for e in ordered
+                                        if e.get("universe_source")}),
+            **marks,
+        })
+
+    groups.sort(key=lambda g: g["summary"]["first_as_of"] or "", reverse=True)
+    if len(warnings) > LEDGER_MAX_WARNINGS:
+        extra = len(warnings) - LEDGER_MAX_WARNINGS
+        warnings = warnings[:LEDGER_MAX_WARNINGS] + [f"…and {extra} more."]
+
+    return _assert_json_clean({
+        "entries_total": len(entries),
+        "price_source": price_source,
+        "cache_coverage": cache.coverage(),
+        "groups": groups,
+        "warnings": warnings,
+    }, "ledger")
 
 
 # ---- static frontend ----

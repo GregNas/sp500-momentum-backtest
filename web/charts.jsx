@@ -683,6 +683,7 @@ const PARAM_HELP = {
   holds: 'How long each monthly cohort is held, in months. Multiple selections run as parallel sleeves.',
   rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
   skipMonths: 'Months skipped between the ranking window and formation — the window ends this many months before the pick. 1 dodges short-term reversal (classic 12-1 momentum = rank lookback 11 + skip 1).',
+  costBps: 'Trading cost in basis points charged on each side of a trade, so replacing the whole book costs twice this. Returns are shown net of it. Set 0 to see gross. Note ETF universes also carry expense-ratio drag that no bps figure captures.',
   horizon: 'How many months forward the event study tracks each cohort after selection.',
   benchmark: 'Ticker the strategy is measured against.',
   riskFree: 'Annual risk-free rate (%) subtracted from returns when computing the Sharpe ratio.',
@@ -695,6 +696,7 @@ const DEFAULT_RANGES = {
   topN: { min: 1, max: 100 },
   rankLookback: { min: 1, max: 12 },
   skipMonths: { min: 0, max: 2 },
+  costBps: { min: 0, max: 100 },
   horizon: { min: 1, max: 24 },
 };
 
@@ -715,10 +717,12 @@ function paramIssues(params, universesInfo) {
     if (!Number.isFinite(v) || v < min || v > max) issues.push(`${label} must be ${min}–${max}`);
   };
   const skipRange = ranges.skipMonths || DEFAULT_RANGES.skipMonths;
+  const costRange = ranges.costBps || DEFAULT_RANGES.costBps;
   check('lookback', 'Lookback', ranges.lookback.min, ranges.lookback.max);
   check('topN', 'Top N', ranges.topN.min, topNMax);
   check('rankLookback', 'Rank lookback', ranges.rankLookback.min, ranges.rankLookback.max);
   check('skipMonths', 'Skip months', skipRange.min, skipRange.max);
+  check('costBps', 'Cost (bps)', costRange.min, costRange.max);
   check('horizon', 'Event horizon', ranges.horizon.min, ranges.horizon.max);
   if (!params.benchmark || !String(params.benchmark).trim()) issues.push('Benchmark ticker is required');
   return issues;
@@ -898,8 +902,13 @@ function RebalanceHistoryRow({ r, theme }) {
   );
 }
 
+// `onRecord` is optional: without it this panel renders exactly as it did before
+// the ledger existed (I2). With it, a Record button sits beside Download CSV and
+// `recordState` (idle|saving|saved|error|exists) plus `recordMessage` report back
+// inline — the ledger panel below is where the record itself is read.
 function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, universe = 'sp500',
-                          theme, accent, headingFont }) {
+                          theme, accent, headingFont,
+                          onRecord, recordState = 'idle', recordMessage, recordedAsOf }) {
   if (!rebalance || !rebalance.length) return null;
   const latest = rebalance[0];
   const history = rebalance.slice(1);
@@ -950,13 +959,53 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             the latest price — ranked over a trailing {rankLookback}-month window ending {skipMonths > 0 ? `${skipMonths}m back` : 'today'}{skipMonths > 0 ? '' : ', the same signal as Top performers'}. History rows below are the month-end sleeve.
           </div>
         </div>
-        <button onClick={downloadCsv} style={{
-          padding: '6px 12px', fontSize: 11, fontWeight: 600,
-          background: accent.dark, color: '#fff', border: 'none',
-          borderRadius: 4, cursor: 'pointer', flexShrink: 0,
-        }}>
-          Download CSV
-        </button>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexShrink: 0 }}>
+          {onRecord && (
+            <div style={{ display: 'flex', flexDirection: 'column',
+                           alignItems: 'flex-end', gap: 3, maxWidth: 260 }}>
+              <button onClick={onRecord}
+                      disabled={!latest.is_live || recordState === 'saving'}
+                      title={latest.is_live
+                        ? 'Append this target to the local out-of-sample ledger (one entry per month)'
+                        : 'Only a live target can be recorded'}
+                      style={{
+                        padding: '6px 12px', fontSize: 11, fontWeight: 600,
+                        background: recordState === 'saved' ? '#ecfdf5' : '#fff',
+                        color: recordState === 'saved' ? '#047857' : accent.dark,
+                        border: `1px solid ${recordState === 'saved' ? '#a7f3d0' : accent.color}`,
+                        borderRadius: 4, whiteSpace: 'nowrap',
+                        cursor: (!latest.is_live || recordState === 'saving')
+                          ? 'not-allowed' : 'pointer',
+                        opacity: latest.is_live ? 1 : 0.55,
+                      }}>
+                {recordState === 'saving' ? 'Recording…'
+                  : recordState === 'saved' ? 'Recorded' : 'Record this target'}
+              </button>
+              {recordMessage && (
+                <span style={{
+                  fontSize: 10, lineHeight: 1.45, textAlign: 'right',
+                  color: recordState === 'error' ? '#b91c1c'
+                    : (recordState === 'exists' ? '#b45309' : theme.muted),
+                }}>
+                  {recordMessage}
+                </span>
+              )}
+              {!recordMessage && recordedAsOf && (
+                <span style={{ fontSize: 10, color: theme.muted,
+                                fontFamily: 'JetBrains Mono, monospace' }}>
+                  ledger holds {recordedAsOf}
+                </span>
+              )}
+            </div>
+          )}
+          <button onClick={downloadCsv} style={{
+            padding: '6px 12px', fontSize: 11, fontWeight: 600,
+            background: accent.dark, color: '#fff', border: 'none',
+            borderRadius: 4, cursor: 'pointer', flexShrink: 0,
+          }}>
+            Download CSV
+          </button>
+        </div>
       </div>
 
       {/* Latest month — the actionable trades */}
@@ -974,6 +1023,15 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             {' '}{latest.holds.length} unchanged
           </span>
         </div>
+        {latest.cost_pct != null && latest.cost_pct > 0 && (
+          <div style={{ fontSize: 10.5, color: theme.muted, marginTop: -6, marginBottom: 10,
+                         fontFamily: 'JetBrains Mono, monospace' }}
+               title="One-way turnover of this single rebalance, and what it costs at the configured rate">
+            {(latest.turnover * 100).toFixed(0)}% turnover ·{' '}
+            {(latest.cost_pct * 100).toFixed(2)}% of capital ·{' '}
+            ${(latest.cost_pct * 10000).toFixed(0)} per $10k
+          </div>
+        )}
         <div style={{ display: 'grid',
                        gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
                        gap: 14 }}>
@@ -1349,6 +1407,492 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
         <div style={{ marginTop: 8, fontSize: 10, color: theme.muted,
                        fontFamily: 'JetBrains Mono, monospace' }}>
           {data.universe_size} tickers · {data.elapsed_s}s
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// LedgerPanel — realized out-of-sample record of the targets the tool recorded.
+// Self-contained like TopPerformersPanel: owns its fetch, loads on mount and
+// whenever `reloadKey` changes. The only panel in the tool whose numbers were
+// not chosen with hindsight.
+// ============================================================
+
+// 'YYYY-MM-DD' -> a local Date. new Date(iso) reads the string as UTC midnight,
+// which lands on the previous day anywhere west of GMT (and can therefore print
+// the wrong year on the chart's January tick).
+function isoToLocalDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '');
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(iso);
+}
+
+// Per-row warning chips. `basis` deliberately reads "verify", not "error": the
+// return is right (both endpoints sit on the current cached basis), it is the
+// price *basis* that moved, and only by a split-shaped amount — dividend
+// re-adjustment alone never reaches the threshold.
+function ledgerChips(r) {
+  const out = [];
+  if (r.n_frozen > 0) {
+    const at = Object.entries(r.frozen_at || {})
+      .map(([t, d]) => `${t} to ${d}`).join(', ');
+    out.push({
+      label: `${r.n_frozen} frozen`, color: '#b45309', bg: '#fef3c7',
+      title: `No bars after the dates shown (delisting, acquisition, symbol change), `
+           + `so these legs are marked at their last close and kept in the `
+           + `equal-weight denominator: ${at}`,
+    });
+  }
+  if (r.unpriced_tickers && r.unpriced_tickers.length) {
+    out.push({
+      label: `${r.unpriced_tickers.length} unmarked`, color: '#4338ca', bg: '#eef2ff',
+      title: `No price at all for ${r.unpriced_tickers.join(', ')}, so they are left `
+           + `out of this row's mean rather than counted as 0%.`,
+    });
+  }
+  if (r.basis_shifted) {
+    const at = Object.entries(r.basis_ratio || {})
+      .map(([t, v]) => `${t} ×${Number(v).toFixed(3)}`).join(', ');
+    out.push({
+      label: 'verify basis', color: '#7c2d12', bg: '#fff7ed',
+      title: `Prices were re-adjusted by a split-shaped amount since recording `
+           + `(${at}). The return is recomputed on the current basis, so it is `
+           + `correct; the chip is a prompt to eyeball the name.`,
+    });
+  }
+  if (r.basis_unverified) {
+    out.push({
+      label: 'stored basis', color: '#b91c1c', bg: '#fef2f2',
+      title: `The cache no longer reaches this segment's start, so the start price `
+           + `comes from the recording and the end price from the current cache `
+           + `(${r.basis_unverified_tickers.join(', ')}). Any split or dividend `
+           + `re-adjustment since then is baked into this return.`,
+    });
+  }
+  return out;
+}
+
+// One collapsed segment row; expands to the per-pick realized returns.
+function LedgerRow({ r, theme, isNewest }) {
+  const [open, setOpen] = useState(false);
+  const picks = (r.tickers || [])
+    .map(t => ({ ticker: t, ret: r.pick_returns ? r.pick_returns[t] : null }))
+    .sort((a, b) => ((b.ret == null ? -Infinity : b.ret) - (a.ret == null ? -Infinity : a.ret)));
+  const worst = picks.reduce(
+    (w, e) => (e.ret != null && (w == null || e.ret < w.ret) ? e : w), null);
+  const chips = ledgerChips(r);
+
+  return (
+    <div style={{ borderTop: `1px solid ${theme.border}` }}>
+      <div role="button" tabIndex={0} aria-expanded={open}
+           onClick={() => setOpen(o => !o)}
+           onKeyDown={(e) => {
+             if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o); }
+           }}
+           style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap',
+                     padding: '8px 0', cursor: 'pointer', outline: 'none' }}>
+        <span style={{ fontSize: 11, fontWeight: 600, width: 96, flexShrink: 0,
+                        fontFamily: 'JetBrains Mono, monospace' }}>
+          {r.as_of}
+        </span>
+        <span style={{ fontSize: 10.5, color: theme.muted, width: 132, flexShrink: 0,
+                        fontFamily: 'JetBrains Mono, monospace' }}>
+          → {r.end_date || 'unmarked'}
+          {r.days_held != null ? ` · ${r.days_held}d` : ''}
+        </span>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, flex: 1, minWidth: 180 }}>
+          {(r.tickers || []).slice(0, 12).map(t => (
+            <span key={t} style={{
+              padding: '1px 6px', fontSize: 10.5, fontWeight: 600,
+              fontFamily: 'JetBrains Mono, monospace',
+              background: theme.bg, border: `1px solid ${theme.border}`,
+              borderRadius: 4, color: theme.text,
+            }}>{t}</span>
+          ))}
+        </div>
+        {isNewest && r.is_open && (
+          <span title="Still held: this segment is marked to the latest cached bar"
+                style={{ fontSize: 9, fontWeight: 600, textTransform: 'uppercase',
+                          letterSpacing: '0.04em', color: '#047857',
+                          background: '#ecfdf5', padding: '1px 5px', borderRadius: 3 }}>
+            open
+          </span>
+        )}
+        {chips.map(c => (
+          <span key={c.label} title={c.title} style={{
+            fontSize: 9, fontWeight: 600, textTransform: 'uppercase',
+            letterSpacing: '0.04em', color: c.color, background: c.bg,
+            padding: '1px 5px', borderRadius: 3, flexShrink: 0, cursor: 'help',
+          }}>{c.label}</span>
+        ))}
+        <span style={{ fontSize: 11, fontWeight: 600, width: 66, textAlign: 'right',
+                        flexShrink: 0, fontFamily: 'JetBrains Mono, monospace',
+                        color: r.return_pct == null ? theme.muted
+                          : (r.return_pct >= 0 ? '#047857' : '#b91c1c') }}>
+          {r.return_pct == null ? '—' : fmtPct(r.return_pct, 1)}
+        </span>
+        <span title={`${r.benchmark || 'benchmark'} over the same dates`}
+              style={{ fontSize: 10.5, width: 62, textAlign: 'right', flexShrink: 0,
+                        fontFamily: 'JetBrains Mono, monospace', color: theme.muted }}>
+          {r.bench_return_pct == null ? '—' : fmtPct(r.bench_return_pct, 1)}
+        </span>
+        <span title="Excess over the benchmark, in percentage points"
+              style={{ fontSize: 10.5, fontWeight: 600, width: 62, textAlign: 'right',
+                        flexShrink: 0, fontFamily: 'JetBrains Mono, monospace',
+                        color: r.excess_pp == null ? theme.muted
+                          : (r.excess_pp >= 0 ? '#047857' : '#b91c1c') }}>
+          {r.excess_pp == null ? '—' : fmtPct(r.excess_pp, 1)}
+        </span>
+        <span aria-hidden="true" style={{ fontSize: 10, color: theme.muted, flexShrink: 0 }}>
+          {open ? '▾' : '▸'}
+        </span>
+      </div>
+      {open && (
+        <div style={{ padding: '0 0 10px 96px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {picks.map(e => {
+              const isWorst = worst && e.ticker === worst.ticker && e.ret != null && e.ret < 0;
+              const frozen = (r.frozen_tickers || []).includes(e.ticker);
+              return (
+                <span key={e.ticker}
+                      title={frozen ? `Frozen at its last close, ${r.frozen_at[e.ticker]}`
+                                    : undefined}
+                      style={{
+                        padding: '2px 7px', fontSize: 10.5,
+                        fontFamily: 'JetBrains Mono, monospace',
+                        background: isWorst ? '#fef2f2' : theme.bg,
+                        border: `1px solid ${isWorst ? '#fecaca' : theme.border}`,
+                        borderRadius: 4, display: 'inline-flex', gap: 5, alignItems: 'baseline',
+                      }}>
+                  <span style={{ fontWeight: 600, color: theme.text }}>
+                    {e.ticker}{frozen ? '*' : ''}
+                  </span>
+                  <span style={{ fontWeight: 600,
+                                  color: e.ret == null ? theme.muted
+                                    : (e.ret >= 0 ? '#047857' : '#b91c1c') }}>
+                    {e.ret == null ? 'n/a' : fmtPct(e.ret, 1)}
+                  </span>
+                </span>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 10, color: theme.muted, marginTop: 6, lineHeight: 1.5 }}>
+            {r.n_priced} of {(r.tickers || []).length} legs marked
+            {r.n_frozen > 0 ? `, ${r.n_frozen} frozen at a last close (still in the denominator)` : ''}
+            {r.start_date ? ` · from the ${r.start_date} close` : ''}
+            {r.note ? ` · ${r.note}` : ''}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Shared Record wiring for both dashboards: owns the request state and the
+// version counter LedgerPanel reloads on, so V1 and V2 stay 2 lines each and
+// cannot drift apart. `ranParams` must be the params of the last *executed* run,
+// not the live sidebar values, or Record would file a cohort under settings the
+// user only typed.
+function useLedgerRecorder(ranParams, rebalance) {
+  const [recordState, setRecordState] = useState('idle');
+  const [recordMessage, setRecordMessage] = useState(null);
+  const [ledgerVersion, setLedgerVersion] = useState(0);
+  const [recordedAsOf, setRecordedAsOf] = useState(null);
+
+  const latest = rebalance && rebalance.length ? rebalance[0] : null;
+
+  // A new run invalidates the previous outcome message.
+  useEffect(() => { setRecordState('idle'); setRecordMessage(null); }, [rebalance]);
+
+  const onRecord = async () => {
+    if (!ranParams || !latest || !latest.is_live || recordState === 'saving') return;
+    setRecordState('saving');
+    setRecordMessage(null);
+    try {
+      const res = await recordLedgerTarget({
+        universe: ranParams.universe || 'sp500',
+        topN: ranParams.topN,
+        rankLookback: ranParams.rankLookback,
+        skipMonths: ranParams.skipMonths || 0,
+        benchmark: ranParams.benchmark || 'SPY',
+        displayedAsOf: latest.as_of || null,
+      });
+      setRecordedAsOf(res.as_of);
+      setLedgerVersion(v => v + 1);
+      const notes = [];
+      if (!res.target_matches_stored) {
+        notes.push('the stored cohort differs from the list on screen (prices were '
+                 + 're-adjusted since it was recorded, and the record is never rewritten)');
+      }
+      if (!res.displayed_as_of_matches) {
+        notes.push(`the screen shows ${latest.as_of} but the latest bar is ${res.as_of}`);
+      }
+      (res.warnings || []).forEach(w => notes.push(w));
+      const tail = notes.length ? ` — ${notes.join('; ')}` : '';
+      if (res.created) {
+        setRecordState('saved');
+        setRecordMessage(`Recorded for ${res.as_of}${tail}`);
+      } else {
+        setRecordState('exists');
+        setRecordMessage(res.reason === 'already_recorded_this_month'
+          ? `Already recorded this month (${res.entry.as_of}); nothing changed${tail}`
+          : `Already recorded for ${res.as_of}${tail}`);
+      }
+    } catch (e) {
+      setRecordState('error');
+      setRecordMessage(e.message || 'Record failed');
+    }
+  };
+
+  return { onRecord, recordState, recordMessage, recordedAsOf, ledgerVersion };
+}
+
+function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [selHash, setSelHash] = useState(null);
+  const [hoverIdx, setHoverIdx] = useState(null);
+  const runningRef = useRef(false);
+
+  const load = async (refresh) => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      setData(await fetchLedger({ refresh: refresh ? 1 : 0 }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      runningRef.current = false;
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(false); }, [reloadKey]);
+
+  const card = {
+    background: theme.card, border: `1px solid ${theme.border}`,
+    borderRadius: 6, padding: '14px 16px',
+  };
+  const groups = (data && data.groups) || [];
+  const group = groups.find(g => g.params_hash === selHash) || groups[0] || null;
+  const s = group ? group.summary : null;
+  const dates = group ? (group.equity.dates || []) : [];
+  const months = useMemo(() => dates.map(isoToLocalDate), [group, dates.length]);
+
+  const series = [];
+  if (group && dates.length > 1) {
+    series.push({ name: 'Recorded targets', values: group.equity.strategy,
+                  color: accent.dark });
+    if ((group.equity.benchmark || []).length === dates.length) {
+      series.push({ name: group.benchmark || benchmark || 'benchmark',
+                    values: group.equity.benchmark,
+                    color: theme.muted, isBenchmark: true });
+    }
+  }
+
+  const tile = (label, value, sub, color) => (
+    <div style={{ minWidth: 128 }}>
+      <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.06em',
+                     textTransform: 'uppercase', color: theme.muted }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 17, fontWeight: 700, marginTop: 2,
+                     fontFamily: 'JetBrains Mono, monospace',
+                     color: color || theme.text }}>
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize: 10, color: theme.muted, marginTop: 1 }}>{sub}</div>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={card}>
+      <div style={{ display: 'flex', justifyContent: 'space-between',
+                     alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700,
+                         fontFamily: headingFont || 'inherit' }}>
+            Out-of-sample ledger
+          </div>
+          <div style={{ fontSize: 11, color: theme.muted, marginTop: 2,
+                         lineHeight: 1.55, maxWidth: 720 }}>
+            Everything above is fitted: the universe is today's index membership and
+            the parameters were chosen by looking at the same window they are scored
+            on. This table is not. It holds what the tool recommended on the day it
+            was recorded, marked to market since, equal-weight and unit-equity.
+            Entries recorded under different settings are separate records and are
+            never blended. Selection is still made from today's membership list, so
+            the returns escape survivorship bias but the selection universe does not.
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+          <button onClick={() => load(false)} disabled={loading}
+                  title="Re-read the ledger and re-mark it from the local price cache"
+                  style={{
+                    padding: '6px 11px', fontSize: 11, fontWeight: 600,
+                    background: loading ? theme.muted : accent.dark, color: '#fff',
+                    border: 'none', borderRadius: 4,
+                    cursor: loading ? 'wait' : 'pointer',
+                  }}>
+            {loading ? 'Loading…' : 'Reload'}
+          </button>
+          <button onClick={() => load(true)} disabled={loading}
+                  title="Pull fresh prices for the recorded tickers only (needs network)"
+                  style={{
+                    padding: '6px 11px', fontSize: 11, fontWeight: 600,
+                    background: 'transparent', color: accent.dark,
+                    border: `1px solid ${theme.border}`, borderRadius: 4,
+                    cursor: loading ? 'wait' : 'pointer',
+                  }}>
+            Refresh prices
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ marginTop: 10, padding: '10px 12px', fontSize: 12, color: '#b91c1c',
+                       background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 4 }}>
+          {error}
+        </div>
+      )}
+
+      {!error && data && data.entries_total === 0 && (
+        <div style={{ marginTop: 10, fontSize: 12, color: theme.muted, lineHeight: 1.6 }}>
+          Nothing recorded yet. Use <strong>Record this target</strong> on the monthly
+          rebalance panel to append the current live target; from the next month on,
+          this table marks it to market from the local price cache. One entry per
+          calendar month per settings group.
+        </div>
+      )}
+
+      {!error && group && (
+        <>
+          {groups.length > 1 && (
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 12 }}>
+              {groups.map(g => {
+                const on = g.params_hash === group.params_hash;
+                return (
+                  <button key={g.params_hash} onClick={() => setSelHash(g.params_hash)}
+                          title={`${g.rows.length} segment(s) · hash ${g.params_hash}`}
+                          style={{
+                            padding: '4px 9px', fontSize: 10.5, fontWeight: 600,
+                            border: `1px solid ${on ? accent.color : theme.border}`,
+                            background: on ? accent.light : '#fff',
+                            color: on ? accent.dark : theme.muted,
+                            borderRadius: 5, cursor: 'pointer',
+                          }}>
+                    {g.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', marginTop: 12,
+                         paddingBottom: 12, borderBottom: `1px solid ${theme.border}` }}>
+            {tile('Recorded targets',
+                  s.total_return == null ? '—' : fmtPct(s.total_return, 1),
+                  `${s.n_segments} segment${s.n_segments === 1 ? '' : 's'} · ${s.n_completed} completed`,
+                  s.total_return == null ? theme.muted
+                    : (s.total_return >= 0 ? '#047857' : '#b91c1c'))}
+            {tile(group.benchmark || 'Benchmark',
+                  s.benchmark_total_return == null ? '—' : fmtPct(s.benchmark_total_return, 1),
+                  'same dates, bar for bar')}
+            {tile('Excess',
+                  s.excess == null ? '—' : `${(s.excess * 100).toFixed(1)}pp`,
+                  'difference of totals',
+                  s.excess == null ? theme.muted
+                    : (s.excess >= 0 ? '#047857' : '#b91c1c'))}
+            {tile('Live since', s.first_as_of || '—',
+                  `through ${s.priced_through || '—'} · ${s.days_live}d`)}
+            {s.annualized
+              ? tile('Sharpe (ann.)', fmtNum(s.annualized.Sharpe),
+                     `CAGR ${fmtPct(s.annualized.CAGR, 1, false)} · vol ${fmtPct(s.annualized.vol, 0, false)}`)
+              : tile('Annualized', 'held back', s.annualized_blocked_reason)}
+          </div>
+
+          {dates.length > 1 ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ height: 240 }}>
+                <EquityCurveChart
+                  series={series} months={months} height={240}
+                  logScale={false} filled={false}
+                  theme={theme} accent={accent}
+                  hoveredIdx={hoverIdx} onHover={setHoverIdx}
+                  ariaLabel={`Realized out-of-sample equity of recorded targets vs `
+                            + `${group.benchmark || 'benchmark'}, `
+                            + `${s.equity_starts_at} to ${s.priced_through}`}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 14, marginTop: 4, paddingLeft: 56,
+                             fontSize: 10.5, fontFamily: 'JetBrains Mono, monospace',
+                             color: theme.muted, flexWrap: 'wrap' }}>
+                {series.map(x => (
+                  <span key={x.name} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span style={{ width: 10, height: 2, background: x.color }} />
+                    <span style={{ color: theme.text }}>{x.name}</span>
+                  </span>
+                ))}
+                <span>{s.equity_starts_at} → {s.priced_through}</span>
+                {!s.equity_covers_all_segments && (
+                  <span style={{ color: '#b45309' }}>
+                    chart covers {s.equity_segments} of {s.n_segments} segments; the
+                    table below is the full chain
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div style={{ marginTop: 10, fontSize: 11, color: theme.muted,
+                           fontStyle: 'italic' }}>
+              {dates.length === 1
+                ? `One bar so far (${dates[0]}). The curve starts drawing once a second `
+                  + `price bar exists — the totals above are already live.`
+                : 'No cached price bars cover these entries yet, so there is nothing to plot.'}
+            </div>
+          )}
+
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'baseline',
+                           fontSize: 9.5, fontWeight: 700, letterSpacing: '0.06em',
+                           textTransform: 'uppercase', color: theme.muted,
+                           paddingBottom: 4 }}>
+              <span style={{ width: 96, flexShrink: 0 }}>Recorded</span>
+              <span style={{ width: 132, flexShrink: 0 }}>Marked to</span>
+              <span style={{ flex: 1, minWidth: 180 }}>Picks</span>
+              <span style={{ width: 66, textAlign: 'right', flexShrink: 0 }}>Return</span>
+              <span style={{ width: 62, textAlign: 'right', flexShrink: 0 }}>
+                {group.benchmark || 'Bench'}
+              </span>
+              <span style={{ width: 62, textAlign: 'right', flexShrink: 0 }}>+/−</span>
+              <span style={{ width: 10, flexShrink: 0 }} />
+            </div>
+            {group.rows.map((r, i) => (
+              <LedgerRow key={`${r.as_of}-${i}`} r={r} theme={theme} isNewest={i === 0} />
+            ))}
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 10, color: theme.muted,
+                         fontFamily: 'JetBrains Mono, monospace' }}>
+            {data.entries_total} entr{data.entries_total === 1 ? 'y' : 'ies'} on file ·
+            prices from {data.price_source}
+            {(group.universe_sources || []).some(x => x !== 'wikipedia' && x !== 'hardcoded')
+              ? ` · universe source ${group.universe_sources.join(', ')}` : ''}
+          </div>
+        </>
+      )}
+
+      {!error && data && (data.warnings || []).length > 0 && (
+        <div style={{ marginTop: 10, padding: '9px 11px', fontSize: 11,
+                       color: '#78350f', background: '#fef3c7',
+                       border: '1px solid #fcd34d', borderRadius: 4, lineHeight: 1.6 }}>
+          {data.warnings.map((w, i) => <div key={i}>{w}</div>)}
         </div>
       )}
     </div>
@@ -1785,4 +2329,5 @@ Object.assign(window, {
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
   PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
   RebalancePanel, EarningsBreakdown, BuildInfo, WhatsNewModal,
+  LedgerPanel, useLedgerRecorder,
 });
