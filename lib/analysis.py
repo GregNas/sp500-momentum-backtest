@@ -42,15 +42,23 @@ def event_study(
     rank_lookback: int,
     horizon: int,
     skip_months: int = 0,
+    benchmark_monthly: pd.Series | None = None,
 ) -> pd.DataFrame:
     """For every month t, identify top_n stocks by trailing rank_lookback return,
     then record their average return at t+1, t+2, ..., t+horizon.
+
+    When ``benchmark_monthly`` is given, each row also carries ``bench_return``
+    — the benchmark's actual return in that same forward month — so the summary
+    can compute a time-aligned alpha instead of comparing against the
+    benchmark's full-sample mean.
 
     Returns a long-form DataFrame: one row per (cohort, h, mean_return, median_return).
     """
     rows = []
 
     ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
+    bench = (benchmark_monthly.reindex(monthly_returns.index)
+             if benchmark_monthly is not None else None)
 
     for i in range(rank_lookback - 1 + skip_months, len(monthly_returns) - horizon):
         cohort_date = monthly_returns.index[i]
@@ -63,12 +71,15 @@ def event_study(
             future = monthly_returns.iloc[i + h][picks].dropna()
             if len(future) == 0:
                 continue
-            rows.append({
+            row = {
                 "cohort": cohort_date,
                 "h": h,
                 "mean_return": future.mean(),
                 "median_return": future.median(),
-            })
+            }
+            if bench is not None:
+                row["bench_return"] = bench.iloc[i + h]
+            rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -108,23 +119,36 @@ def _newey_west_tstat(x: np.ndarray, lag: int | None = None) -> float:
 def event_study_summary(events: pd.DataFrame, benchmark_monthly: pd.Series) -> pd.DataFrame:
     """Aggregate event study by horizon, with benchmark comparison.
 
-    The ``t_stat`` column tests alpha (avg cohort return minus the benchmark
-    monthly mean) with a Newey-West HAC standard error, so overlapping cohorts
-    don't inflate significance. See :func:`_newey_west_tstat`.
+    When the events carry a ``bench_return`` column (see :func:`event_study`),
+    alpha is the mean of the *same-month* cohort-minus-benchmark spread,
+    ``win_rate`` is the share of cohorts beating the benchmark at that horizon,
+    and the ``t_stat`` tests that aligned spread — so cohorts formed ahead of
+    strong market stretches don't look alpha-positive by construction. Without
+    the column (legacy callers) the spread falls back to the benchmark's
+    full-sample mean and ``win_rate`` counts cohorts above zero.
+
+    The ``t_stat`` uses a Newey-West HAC standard error, so overlapping
+    cohorts don't inflate significance. See :func:`_newey_west_tstat`.
     """
     bench_mean = benchmark_monthly.mean()
+    aligned = "bench_return" in events.columns
     rows: dict[int, dict] = {}
     for h, grp in events.groupby("h"):
         s = grp["mean_return"]
+        if aligned:
+            valid = grp.dropna(subset=["bench_return"])
+            spread = valid["mean_return"] - valid["bench_return"]
+        else:
+            spread = s - bench_mean
         rows[int(h)] = {
             "avg_return":     s.mean(),
             "median_return":  s.median(),
-            "win_rate":       (s > 0).mean(),
+            "win_rate":       (spread > 0).mean() if aligned else (s > 0).mean(),
             "std":            s.std(),
             "n_cohorts":      int(s.count()),
             "benchmark_avg":  bench_mean,
-            "alpha_vs_bench": s.mean() - bench_mean,
-            "t_stat":         _newey_west_tstat((s - bench_mean).values),
+            "alpha_vs_bench": spread.mean(),
+            "t_stat":         _newey_west_tstat(spread.values),
         }
     cols = ["avg_return", "median_return", "win_rate", "std", "n_cohorts",
             "benchmark_avg", "alpha_vs_bench", "t_stat"]

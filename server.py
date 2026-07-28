@@ -141,7 +141,7 @@ def _run_backtest(params: BacktestParams) -> dict:
     # ---- Event study ----
     events = analysis.event_study(
         monthly, top_n=params.topN, rank_lookback=params.rankLookback, horizon=params.horizon,
-        skip_months=params.skipMonths,
+        skip_months=params.skipMonths, benchmark_monthly=benchmark_monthly,
     )
     summary = analysis.event_study_summary(events, benchmark_monthly)
 

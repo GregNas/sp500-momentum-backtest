@@ -621,6 +621,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
               <div style={{ fontSize: 11, color: v2Theme.muted, marginBottom: 8 }}>
                 Forward return at horizon h after a top-{params.topN} cohort is selected.
                 n={cohortCount} cohorts. Dark bars clear |t| ≥ 2 (5% significance).
+                Alpha and win rate are vs same-month {params.benchmark} returns.
               </div>
               <div style={{ height: 220 }}>
                 <EventStudyChart
@@ -635,7 +636,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
               }}>
                 <strong>Verdict:</strong>{' '}
                 {sigHorizon
-                  ? <>winners keep winning at <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600 }}>h={sigHorizon.h}</span> (t={sigHorizon.t_stat.toFixed(2)}, α={fmtPct(sigHorizon.alpha, 2)}/mo). Other horizons are noise — be skeptical.</>
+                  ? <>winners keep winning at <span style={{ fontFamily: 'JetBrains Mono, monospace', fontWeight: 600 }}>h={sigHorizon.h}</span> (t={sigHorizon.t_stat.toFixed(2)}, α={fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark}). Other horizons are noise — be skeptical.</>
                   : <>no horizon clears 5% significance (|t| ≥ 2). On this run, the alpha is indistinguishable from noise.</>
                 }
               </div>

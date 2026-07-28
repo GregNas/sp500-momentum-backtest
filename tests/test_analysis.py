@@ -91,6 +91,58 @@ def test_event_study_summary_structure():
                - (summ.loc[1, "avg_return"] - bench.mean())) < 1e-12
 
 
+# ---- time-aligned event-study alpha ----
+
+def test_event_study_summary_aligned_alpha_and_win_rate():
+    rng = np.random.default_rng(6)
+    rows = []
+    for cohort in range(40):
+        for h in (1, 2):
+            rows.append({"cohort": cohort, "h": h,
+                         "mean_return": rng.normal(0.02, 0.05),
+                         "median_return": 0.0,
+                         "bench_return": rng.normal(0.01, 0.04)})
+    events = pd.DataFrame(rows)
+    bench = pd.Series(rng.normal(0.008, 0.04, 60))
+    summ = analysis.event_study_summary(events, bench)
+
+    grp = events[events["h"] == 1]
+    spread = grp["mean_return"] - grp["bench_return"]
+    assert abs(summ.loc[1, "alpha_vs_bench"] - spread.mean()) < 1e-12
+    assert abs(summ.loc[1, "win_rate"] - (spread > 0).mean()) < 1e-12
+    assert abs(summ.loc[1, "t_stat"]
+               - analysis._newey_west_tstat(spread.values)) < 1e-12
+    # benchmark_avg stays the full-sample mean (chart reference line)
+    assert abs(summ.loc[1, "benchmark_avg"] - bench.mean()) < 1e-12
+
+
+def test_event_study_summary_aligned_drops_missing_benchmark_months():
+    rows = [
+        {"cohort": 0, "h": 1, "mean_return": 0.05, "median_return": 0.0, "bench_return": 0.01},
+        {"cohort": 1, "h": 1, "mean_return": 0.03, "median_return": 0.0, "bench_return": np.nan},
+        {"cohort": 2, "h": 1, "mean_return": -0.02, "median_return": 0.0, "bench_return": 0.01},
+    ]
+    summ = analysis.event_study_summary(pd.DataFrame(rows), pd.Series([0.01] * 12))
+    # NaN benchmark row excluded from the spread stats but not from n_cohorts.
+    assert abs(summ.loc[1, "alpha_vs_bench"] - np.mean([0.04, -0.03])) < 1e-12
+    assert abs(summ.loc[1, "win_rate"] - 0.5) < 1e-12
+    assert summ.loc[1, "n_cohorts"] == 3
+
+
+def test_event_study_stamps_time_aligned_bench_return():
+    n = 10
+    idx = _months(n)
+    # 4 tickers, deterministic returns; benchmark = distinct known series
+    r = pd.DataFrame({f"T{i}": np.linspace(0.01 * (i + 1), 0.02 * (i + 1), n)
+                      for i in range(4)}, index=idx)
+    bench = pd.Series(np.arange(n) / 100.0, index=idx)
+    events = analysis.event_study(r, top_n=2, rank_lookback=1, horizon=2,
+                                  benchmark_monthly=bench)
+    for _, row in events.iterrows():
+        i = idx.get_loc(row["cohort"])
+        assert abs(row["bench_return"] - bench.iloc[i + row["h"]]) < 1e-12
+
+
 # ---- calendar_year_returns ----
 
 def test_calendar_year_returns_compounds_within_year():

@@ -536,7 +536,7 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
                                   fontFamily: 'JetBrains Mono, monospace' }}>
                     h={sigHorizon.h}
                   </span>
-                  <span>α = {fmtPct(sigHorizon.alpha, 2)}/mo · t = {sigHorizon.t_stat.toFixed(2)} — only horizon clearing the 5% significance bar.</span>
+                  <span>α = {fmtPct(sigHorizon.alpha, 2)}/mo vs same-month {params.benchmark} · t = {sigHorizon.t_stat.toFixed(2)} — only horizon clearing the 5% significance bar.</span>
                 </div>
               ) : (
                 <div style={{

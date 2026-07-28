@@ -78,6 +78,7 @@ def main():
     print("\n--- EVENT STUDY ---")
     events = analysis.event_study(
         monthly, top_n=TOP_N, rank_lookback=RANK_LOOKBACK, horizon=EVENT_HORIZON,
+        benchmark_monthly=benchmark_monthly,
     )
     summary = analysis.event_study_summary(events, benchmark_monthly)
     print(summary.round(4).to_string())
