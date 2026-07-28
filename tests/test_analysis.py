@@ -273,6 +273,41 @@ def test_rebalance_schedule_exposes_picks():
         assert set(row["picks"]) == set(row["buys"]) | set(row["holds"])
 
 
+def test_top_performers_quality_stats():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=8)
+    rows = analysis.top_performers_period(prices, top_n=3, days=30)
+    assert rows
+    end_ts = prices.index.max()
+    for r in rows:
+        col = prices[r["ticker"]]
+        start_ts = pd.Timestamp(r["start_date"])
+        daily = col.loc[start_ts:end_ts].pct_change().dropna()
+        assert abs(r["vol_ann"] - daily.std() * np.sqrt(252)) < 1e-12
+        assert abs(r["max_day_move"]
+                   - daily.iloc[int(np.argmax(np.abs(daily.values)))]) < 1e-12
+        # 6-month fixture: the trailing-year slice is the whole series
+        assert abs(r["below_52w_high"] - (col.loc[end_ts] / col.max() - 1)) < 1e-12
+        target = end_ts - pd.Timedelta(days=91)
+        first = col.loc[col.index >= target].iloc[0]
+        assert abs(r["ret_3m"] - (col.loc[end_ts] / first - 1)) < 1e-12
+        # history doesn't reach back a year → None, not a fabricated number
+        assert r["ret_12m"] is None
+        assert r["spark"] and len(r["spark"]) >= 8
+
+
+def test_top_performers_streak_counts_persistent_winner():
+    # T0 compounds every day; the rest are flat → T0 tops every prior window.
+    idx = pd.bdate_range("2024-01-01", "2026-07-01")
+    n = len(idx)
+    cols = {"T0": 100 * np.exp(np.linspace(0, 3, n))}
+    for i in range(1, 5):
+        cols[f"T{i}"] = np.full(n, 100.0) + i
+    prices = pd.DataFrame(cols, index=idx)
+    rows = analysis.top_performers_period(prices, top_n=2, days=30)
+    r0 = next(r for r in rows if r["ticker"] == "T0")
+    assert r0["streak"] == 12  # capped at 12 prior windows
+
+
 def test_recent_picks_attribution_sums_to_cohort_mean():
     prices = _daily_prices([f"T{i}" for i in range(6)], seed=4)
     monthly = datalib.to_monthly_returns(prices)

@@ -1021,6 +1021,23 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
 // Self-contained: owns its own params + fetch state. Drop into a dashboard
 // with a `theme` and `accent` to restyle.
 // ============================================================
+// Durable-vs-spike badge: one big session driving the move is a squeeze
+// candidate; sitting within 5% of the 52-week high is the classic durable-
+// momentum profile.
+function leaderboardBadge(r) {
+  if (r.max_day_move != null && r.return_pct != null
+      && Math.abs(r.max_day_move) >= 0.05
+      && Math.abs(r.max_day_move) >= 0.5 * Math.abs(r.return_pct)) {
+    return { label: 'spike', color: '#b45309', bg: '#fef3c7',
+             title: 'One session drove ≥50% of the window return — squeeze/news candidate' };
+  }
+  if (r.below_52w_high != null && r.below_52w_high >= -0.05) {
+    return { label: 'near high', color: '#047857', bg: '#ecfdf5',
+             title: 'Within 5% of its 52-week high — durable-momentum profile' };
+  }
+  return null;
+}
+
 function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', cacheInfo, universes }) {
   const universeDefaultTopN = { sp500: 10, global_etfs: 5, us_sector_etfs: 3 };
   const [topN, setTopN] = useState(universeDefaultTopN[universe] || 10);
@@ -1028,6 +1045,7 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
   const [data, setData] = useState(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
+  const [sort, setSort] = useState(null);   // {key, dir} or null = rank order
   const runningRef = useRef(false);
 
   const refresh = async (n, d) => {
@@ -1153,51 +1171,120 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
         </div>
       )}
 
-      {data && data.results && (
-        <table style={{
-          width: '100%', fontSize: 12,
-          fontFamily: 'JetBrains Mono, monospace',
-          borderCollapse: 'collapse',
-        }}>
-          <thead>
-            <tr style={{
-              color: theme.muted, fontSize: 10,
-              textTransform: 'uppercase', letterSpacing: '0.05em',
+      {data && data.results && (() => {
+        const rows = sort
+          ? [...data.results].sort((a, b) => {
+              const an = a[sort.key] == null ? -Infinity : a[sort.key];
+              const bn = b[sort.key] == null ? -Infinity : b[sort.key];
+              return sort.dir === 'desc' ? bn - an : an - bn;
+            })
+          : data.results;
+        const clickSort = (key) => setSort(s =>
+          (s && s.key === key)
+            ? (s.dir === 'desc' ? { key, dir: 'asc' } : null)  // desc → asc → rank order
+            : { key, dir: 'desc' });
+        const thBase = { padding: '6px 4px', fontWeight: 500,
+                         borderBottom: `1px solid ${theme.border}`, whiteSpace: 'nowrap' };
+        const SortTh = ({ label, k, title }) => (
+          <th title={title || 'Click to sort'} onClick={() => clickSort(k)}
+              aria-sort={sort?.key === k ? (sort.dir === 'desc' ? 'descending' : 'ascending') : 'none'}
+              style={{ ...thBase, textAlign: 'right', cursor: 'pointer',
+                       color: sort?.key === k ? theme.text : undefined,
+                       userSelect: 'none' }}>
+            {label}{sort?.key === k ? (sort.dir === 'desc' ? ' ▾' : ' ▴') : ''}
+          </th>
+        );
+        const num = (v, digits = 1, signed = true) => (
+          <td style={{ padding: '7px 4px', textAlign: 'right', whiteSpace: 'nowrap',
+                        color: v == null ? theme.muted
+                          : (signed ? (v >= 0 ? '#047857' : '#b91c1c') : theme.text) }}>
+            {v == null ? '—' : fmtPct(v, digits, signed)}
+          </td>
+        );
+        return (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{
+              width: '100%', fontSize: 12,
+              fontFamily: 'JetBrains Mono, monospace',
+              borderCollapse: 'collapse',
             }}>
-              <th style={{ textAlign: 'right', padding: '6px 4px', fontWeight: 500,
-                            borderBottom: `1px solid ${theme.border}`, width: 32 }}>#</th>
-              <th style={{ textAlign: 'left', padding: '6px 4px', fontWeight: 500,
-                            borderBottom: `1px solid ${theme.border}` }}>Ticker</th>
-              <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500,
-                            borderBottom: `1px solid ${theme.border}`,
-                            fontFamily: 'inherit' }}>Company</th>
-              <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500,
-                            borderBottom: `1px solid ${theme.border}`,
-                            fontFamily: 'inherit' }}>{data?.meta_label || 'Sector'}</th>
-              <th style={{ textAlign: 'right', padding: '6px 4px', fontWeight: 500,
-                            borderBottom: `1px solid ${theme.border}` }}>{days}d return</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.results.map(r => (
-              <tr key={r.ticker} style={{ borderBottom: `1px solid ${theme.border}` }}>
-                <td style={{ padding: '7px 4px', textAlign: 'right',
-                              color: theme.muted }}>{r.rank}</td>
-                <td style={{ padding: '7px 4px', fontWeight: 600,
-                              color: theme.text }}>{r.ticker}</td>
-                <td style={{ padding: '7px 8px', fontFamily: 'inherit',
-                              color: theme.text }}>{r.name || '—'}</td>
-                <td style={{ padding: '7px 8px', fontFamily: 'inherit',
-                              color: theme.muted }}>{r.sector || '—'}</td>
-                <td style={{ padding: '7px 4px', textAlign: 'right', fontWeight: 600,
-                              color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
-                  {fmtPct(r.return_pct, 2)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+              <thead>
+                <tr style={{
+                  color: theme.muted, fontSize: 10,
+                  textTransform: 'uppercase', letterSpacing: '0.05em',
+                }}>
+                  <th style={{ ...thBase, textAlign: 'right', width: 32 }}>#</th>
+                  <th style={{ ...thBase, textAlign: 'left' }}>Ticker</th>
+                  <th style={{ ...thBase, textAlign: 'left', fontFamily: 'inherit' }}>Company</th>
+                  <th style={{ ...thBase, textAlign: 'left', fontFamily: 'inherit' }}>
+                    {data?.meta_label || 'Sector'}
+                  </th>
+                  <th style={{ ...thBase, textAlign: 'left' }}
+                      title="Trailing year, weekly closes">1y</th>
+                  <SortTh label={`${days}d return`} k="return_pct" />
+                  <SortTh label="3m" k="ret_3m" title="Trailing 3-month return" />
+                  <SortTh label="12m" k="ret_12m" title="Trailing 12-month return" />
+                  <SortTh label="Vol" k="vol_ann"
+                          title="Annualized volatility of daily returns over the ranking window" />
+                  <SortTh label="vs 52w hi" k="below_52w_high"
+                          title="End price vs trailing 52-week high (0% = at the high)" />
+                  <SortTh label="Max 1d" k="max_day_move"
+                          title="Largest single-day move inside the ranking window" />
+                  <SortTh label="Streak" k="streak"
+                          title="Consecutive prior windows already ranked in the top N" />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r => {
+                  const badge = leaderboardBadge(r);
+                  return (
+                    <tr key={r.ticker} style={{ borderBottom: `1px solid ${theme.border}` }}>
+                      <td style={{ padding: '7px 4px', textAlign: 'right',
+                                    color: theme.muted }}>{r.rank}</td>
+                      <td style={{ padding: '7px 4px', fontWeight: 600, whiteSpace: 'nowrap',
+                                    color: theme.text }}>
+                        {r.ticker}
+                        {badge && (
+                          <span title={badge.title} style={{
+                            marginLeft: 6, padding: '1px 5px', fontSize: 9,
+                            fontFamily: 'Inter, sans-serif', fontWeight: 600,
+                            textTransform: 'uppercase', letterSpacing: '0.04em',
+                            color: badge.color, background: badge.bg,
+                            borderRadius: 3, verticalAlign: 'middle',
+                          }}>{badge.label}</span>
+                        )}
+                      </td>
+                      <td style={{ padding: '7px 8px', fontFamily: 'inherit',
+                                    color: theme.text }}>{r.name || '—'}</td>
+                      <td style={{ padding: '7px 8px', fontFamily: 'inherit',
+                                    color: theme.muted }}>{r.sector || '—'}</td>
+                      <td style={{ padding: '4px 4px' }}>
+                        {r.spark && r.spark.length > 1
+                          ? <Sparkline values={r.spark} color={accent.color} width={70} height={20} />
+                          : <span style={{ color: theme.muted }}>—</span>}
+                      </td>
+                      <td style={{ padding: '7px 4px', textAlign: 'right', fontWeight: 600,
+                                    whiteSpace: 'nowrap',
+                                    color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
+                        {fmtPct(r.return_pct, 2)}
+                      </td>
+                      {num(r.ret_3m)}
+                      {num(r.ret_12m)}
+                      {num(r.vol_ann, 0, false)}
+                      {num(r.below_52w_high)}
+                      {num(r.max_day_move)}
+                      <td style={{ padding: '7px 4px', textAlign: 'right',
+                                    color: r.streak > 0 ? theme.text : theme.muted }}>
+                        {r.streak > 0 ? `×${r.streak}` : 'new'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        );
+      })()}
 
       {data && data.elapsed_s != null && (
         <div style={{ marginTop: 8, fontSize: 10, color: theme.muted,

@@ -293,6 +293,52 @@ def rebalance_schedule(
     return out
 
 
+def _window_return_top_set(
+    prices: pd.DataFrame, end_ts: pd.Timestamp, days: int, top_n: int,
+) -> set | None:
+    """The top_n ticker set by simple return over the `days` window ending at
+    the last bar at-or-before `end_ts`, or None when the window can't be formed."""
+    upto = prices.loc[prices.index <= end_ts]
+    if upto.empty:
+        return None
+    actual_end = upto.index[-1]
+    from_start = prices.loc[prices.index >= actual_end - pd.Timedelta(days=days)]
+    if from_start.empty or from_start.index[0] >= actual_end:
+        return None
+    r = (upto.iloc[-1] / from_start.iloc[0] - 1).dropna()
+    if r.empty:
+        return None
+    return set(r.nlargest(top_n).index)
+
+
+def _pick_quality_stats(col: pd.Series, start_ts, end_ts) -> dict:
+    """Per-pick context stats from daily closes: volatility, squeeze detector,
+    52-week-high proximity, trailing returns, and a weekly sparkline. Fields
+    are None when the ticker's history doesn't reach far enough back."""
+    end_price = float(col.loc[end_ts])
+    window = col.loc[start_ts:end_ts].dropna()
+    daily = window.pct_change().dropna()
+    out: dict = {
+        "vol_ann": float(daily.std() * np.sqrt(252)) if len(daily) >= 5 else None,
+        "max_day_move": (float(daily.iloc[int(np.argmax(np.abs(daily.values)))])
+                         if len(daily) else None),
+    }
+    year = col.loc[col.index >= end_ts - pd.Timedelta(days=365)].dropna()
+    out["below_52w_high"] = (float(end_price / year.max() - 1)
+                             if len(year) and year.max() > 0 else None)
+    for label, d in (("ret_3m", 91), ("ret_6m", 182), ("ret_12m", 365)):
+        target = end_ts - pd.Timedelta(days=d)
+        past = col.loc[col.index >= target].dropna()
+        if past.empty or (past.index[0] - target).days > 10:
+            out[label] = None  # history doesn't reach back that far
+        else:
+            out[label] = float(end_price / float(past.iloc[0]) - 1)
+    weekly = year.resample("W").last().dropna()
+    out["spark"] = ([round(float(v), 3) for v in weekly]
+                    if len(weekly) >= 8 else None)
+    return out
+
+
 def top_performers_period(
     prices: pd.DataFrame,
     top_n: int = 10,
@@ -305,7 +351,13 @@ def top_performers_period(
     target start date, so weekend/holiday boundaries are handled naturally.
 
     Returns the top_n entries sorted by return desc, each:
-      {ticker, return_pct, start_date, end_date, start_price, end_price}
+      {ticker, return_pct, start_date, end_date, start_price, end_price,
+       vol_ann, max_day_move, below_52w_high, ret_3m, ret_6m, ret_12m,
+       spark, streak}
+    ``streak`` counts how many consecutive *prior* windows of the same length
+    the ticker already ranked in the top_n (capped at 12) — signal persistence.
+    Context fields are None where the cached history doesn't reach back far
+    enough (e.g. a fetch window shorter than a year).
     """
     if prices.empty:
         return []
@@ -325,8 +377,22 @@ def top_performers_period(
         return []
 
     top = returns.nlargest(top_n)
+
+    # Prior-window top-N sets, shared by every pick's streak count.
+    prior_sets: list[set | None] = []
+    for k in range(1, 13):
+        prior_sets.append(
+            _window_return_top_set(prices, end_ts - pd.Timedelta(days=k * days),
+                                   days=days, top_n=top_n)
+        )
+
     rows: list[dict] = []
     for ticker, ret in top.items():
+        streak = 0
+        for s in prior_sets:
+            if s is None or ticker not in s:
+                break
+            streak += 1
         rows.append({
             "ticker": ticker,
             "return_pct": float(ret),
@@ -334,6 +400,8 @@ def top_performers_period(
             "end_date": end_ts.strftime("%Y-%m-%d"),
             "start_price": float(start_row[ticker]),
             "end_price": float(end_row[ticker]),
+            "streak": streak,
+            **_pick_quality_stats(prices[ticker], start_ts, end_ts),
         })
     return rows
 

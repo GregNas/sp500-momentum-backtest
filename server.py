@@ -308,7 +308,10 @@ def _top_performers(params: TopPerformersParams) -> dict:
 
     t_start = time.time()
     end = datetime.today()
-    start = end - timedelta(days=params.days + 5)  # buffer for weekends/holidays
+    # Pull at least ~1 year so the 52w-high / trailing-return / sparkline /
+    # streak context columns are populated (the parquet cache usually already
+    # covers this from a backtest run, so it's a slice, not a re-download).
+    start = end - timedelta(days=max(params.days + 5, 375))
     start_str, end_str = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
     try:
@@ -351,6 +354,15 @@ def _top_performers(params: TopPerformersParams) -> dict:
             "end_price": row["end_price"],
             "name": info.get("name", ""),
             "sector": info.get("sector", ""),
+            # signal-quality context (None where history is too short)
+            "vol_ann": row.get("vol_ann"),
+            "max_day_move": row.get("max_day_move"),
+            "below_52w_high": row.get("below_52w_high"),
+            "ret_3m": row.get("ret_3m"),
+            "ret_6m": row.get("ret_6m"),
+            "ret_12m": row.get("ret_12m"),
+            "spark": row.get("spark"),
+            "streak": row.get("streak"),
         })
 
     actual_start = pd.Timestamp(results[0]["start_date"])
