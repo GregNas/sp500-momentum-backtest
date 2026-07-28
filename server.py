@@ -335,7 +335,11 @@ def _top_performers(params: TopPerformersParams) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc}")
 
-    results = analysis.top_performers_period(prices, top_n=params.topN, days=params.days)
+    # "Bubbling under": the next ~10 ranks past the leaderboard cutoff.
+    watch_n = min(10, max(0, len(tickers) - params.topN - 1))
+    results = analysis.top_performers_period(
+        prices, top_n=params.topN, days=params.days, watch_n=watch_n,
+    )
 
     if not results:
         raise HTTPException(
@@ -343,10 +347,10 @@ def _top_performers(params: TopPerformersParams) -> dict:
             detail="No data available for the requested window. Try a larger `days` value.",
         )
 
-    enriched = []
-    for rank, row in enumerate(results, start=1):
+    def enrich(row: dict, rank: int) -> dict:
         info = meta.get(row["ticker"], {})
-        enriched.append({
+        prior = row.get("prior_rank")
+        return {
             "rank": rank,
             "ticker": row["ticker"],
             "return_pct": row["return_pct"],
@@ -363,13 +367,21 @@ def _top_performers(params: TopPerformersParams) -> dict:
             "ret_12m": row.get("ret_12m"),
             "spark": row.get("spark"),
             "streak": row.get("streak"),
-        })
+            "prior_rank": prior,
+            "rank_delta": (prior - rank) if prior is not None else None,  # + = moved up
+            "new_entrant": row.get("new_entrant"),
+        }
+
+    enriched = [enrich(row, rank) for rank, row in enumerate(results[:params.topN], start=1)]
+    watchlist = [enrich(row, rank) for rank, row
+                 in enumerate(results[params.topN:], start=params.topN + 1)]
 
     actual_start = pd.Timestamp(results[0]["start_date"])
     actual_end = pd.Timestamp(results[0]["end_date"])
 
     return {
         "results": enriched,
+        "watchlist": watchlist,
         "window": {
             "start_date": results[0]["start_date"],
             "end_date": results[0]["end_date"],

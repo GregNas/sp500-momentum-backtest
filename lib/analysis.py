@@ -343,6 +343,7 @@ def top_performers_period(
     prices: pd.DataFrame,
     top_n: int = 10,
     days: int = 30,
+    watch_n: int = 0,
 ) -> list[dict]:
     """Rank tickers by simple return over the trailing `days` calendar days.
 
@@ -350,12 +351,19 @@ def top_performers_period(
     back `days` calendar days from there. Picks the first bar at-or-after the
     target start date, so weekend/holiday boundaries are handled naturally.
 
-    Returns the top_n entries sorted by return desc, each:
+    With ``watch_n > 0`` the list continues past the leaderboard into the
+    "bubbling under" ranks top_n+1..top_n+watch_n (streak/new-entrant stats
+    stay relative to top_n).
+
+    Returns the top_n (+ watch_n) entries sorted by return desc, each:
       {ticker, return_pct, start_date, end_date, start_price, end_price,
        vol_ann, max_day_move, below_52w_high, ret_3m, ret_6m, ret_12m,
-       spark, streak}
+       spark, streak, prior_rank, new_entrant}
     ``streak`` counts how many consecutive *prior* windows of the same length
     the ticker already ranked in the top_n (capped at 12) — signal persistence.
+    ``prior_rank`` is the ticker's rank over the same-length window ending at
+    the last bar ≥ 7 calendar days earlier (rank velocity); ``new_entrant`` is
+    True when the ticker was absent from the top-2N set one full window back.
     Context fields are None where the cached history doesn't reach back far
     enough (e.g. a fetch window shorter than a year).
     """
@@ -376,7 +384,7 @@ def top_performers_period(
     if returns.empty:
         return []
 
-    top = returns.nlargest(top_n)
+    top = returns.nlargest(top_n + max(0, watch_n))
 
     # Prior-window top-N sets, shared by every pick's streak count.
     prior_sets: list[set | None] = []
@@ -385,6 +393,23 @@ def top_performers_period(
             _window_return_top_set(prices, end_ts - pd.Timedelta(days=k * days),
                                    days=days, top_n=top_n)
         )
+
+    # NEW-entrant reference: the top-2N set one full window back.
+    prev_top2n = _window_return_top_set(
+        prices, end_ts - pd.Timedelta(days=days), days=days, top_n=top_n * 2,
+    )
+
+    # Full-universe ranks over the same-length window ending ≥ 7 days earlier,
+    # for the rank-velocity arrows.
+    prior_ranks = None
+    upto_prev = prices.loc[prices.index <= end_ts - pd.Timedelta(days=7)]
+    if not upto_prev.empty:
+        prev_end = upto_prev.index[-1]
+        prev_from = prices.loc[prices.index >= prev_end - pd.Timedelta(days=days)]
+        if not prev_from.empty and prev_from.index[0] < prev_end:
+            prev_returns = (upto_prev.iloc[-1] / prev_from.iloc[0] - 1).dropna()
+            if not prev_returns.empty:
+                prior_ranks = prev_returns.rank(ascending=False, method="min")
 
     rows: list[dict] = []
     for ticker, ret in top.items():
@@ -401,6 +426,11 @@ def top_performers_period(
             "start_price": float(start_row[ticker]),
             "end_price": float(end_row[ticker]),
             "streak": streak,
+            "prior_rank": (int(prior_ranks[ticker])
+                           if prior_ranks is not None and ticker in prior_ranks.index
+                           else None),
+            "new_entrant": ((ticker not in prev_top2n)
+                            if prev_top2n is not None else None),
             **_pick_quality_stats(prices[ticker], start_ts, end_ts),
         })
     return rows

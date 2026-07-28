@@ -308,6 +308,36 @@ def test_top_performers_streak_counts_persistent_winner():
     assert r0["streak"] == 12  # capped at 12 prior windows
 
 
+def test_top_performers_watchlist_and_new_entrants():
+    idx = pd.bdate_range("2025-01-01", "2026-07-01")
+    n = len(idx)
+    # Distinct steady drifts (T5 strongest) + one name that only bursts in the
+    # final 2 weeks — in the current top set but absent from the prior window's.
+    cols = {f"T{i}": 100 * np.exp(np.linspace(0, 0.05 * i, n)) for i in range(1, 6)}
+    burst = np.full(n, 100.0)
+    burst[-10:] = 100 * np.exp(np.linspace(0, 0.5, 10))
+    cols["JUMP"] = burst
+    prices = pd.DataFrame(cols, index=idx)
+
+    rows = analysis.top_performers_period(prices, top_n=2, days=30, watch_n=3)
+    assert len(rows) == 5
+    plain = analysis.top_performers_period(prices, top_n=2, days=30)
+    assert [r["ticker"] for r in rows[:2]] == [r["ticker"] for r in plain]
+
+    jump = next(r for r in rows if r["ticker"] == "JUMP")
+    steady = next(r for r in rows if r["ticker"] == "T5")
+    assert jump["new_entrant"] is True
+    assert steady["new_entrant"] is False
+
+    # prior_rank matches a hand-computed rank over the window ending >= 7d back.
+    end_ts = prices.index.max()
+    upto = prices.loc[prices.index <= end_ts - pd.Timedelta(days=7)]
+    prev_end = upto.index[-1]
+    prev_from = prices.loc[prices.index >= prev_end - pd.Timedelta(days=30)]
+    prev_rank = (upto.iloc[-1] / prev_from.iloc[0] - 1).rank(ascending=False, method="min")
+    assert steady["prior_rank"] == int(prev_rank["T5"])
+
+
 def test_recent_picks_attribution_sums_to_cohort_mean():
     prices = _daily_prices([f"T{i}" for i in range(6)], seed=4)
     monthly = datalib.to_monthly_returns(prices)

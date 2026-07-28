@@ -1222,6 +1222,8 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
                   <th style={{ ...thBase, textAlign: 'left' }}
                       title="Trailing year, weekly closes">1y</th>
                   <SortTh label={`${days}d return`} k="return_pct" />
+                  <SortTh label="Δ 7d" k="rank_delta"
+                          title="Rank change vs the same window a week earlier (▲ = moved up)" />
                   <SortTh label="3m" k="ret_3m" title="Trailing 3-month return" />
                   <SortTh label="12m" k="ret_12m" title="Trailing 12-month return" />
                   <SortTh label="Vol" k="vol_ann"
@@ -1268,6 +1270,15 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
                                     color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
                         {fmtPct(r.return_pct, 2)}
                       </td>
+                      <td style={{ padding: '7px 4px', textAlign: 'right', whiteSpace: 'nowrap',
+                                    fontSize: 11,
+                                    color: r.rank_delta == null ? theme.muted
+                                      : (r.rank_delta > 0 ? '#047857'
+                                        : (r.rank_delta < 0 ? '#b91c1c' : theme.muted)) }}>
+                        {r.rank_delta == null ? '—'
+                          : (r.rank_delta > 0 ? `▲${r.rank_delta}`
+                            : (r.rank_delta < 0 ? `▼${-r.rank_delta}` : '·'))}
+                      </td>
                       {num(r.ret_3m)}
                       {num(r.ret_12m)}
                       {num(r.vol_ann, 0, false)}
@@ -1285,6 +1296,49 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
           </div>
         );
       })()}
+
+      {data && data.watchlist && data.watchlist.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+                         textTransform: 'uppercase', color: theme.muted, marginBottom: 6 }}>
+            Bubbling under · ranks {data.results.length + 1}–{data.results.length + data.watchlist.length} by {days}d return
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+            {data.watchlist.map(r => (
+              <span key={r.ticker}
+                    title={`${r.name || r.ticker}${r.sector ? ` · ${r.sector}` : ''}${r.prior_rank != null ? ` · was #${r.prior_rank} a week ago` : ''}`}
+                    style={{
+                      padding: '3px 8px', fontSize: 11,
+                      fontFamily: 'JetBrains Mono, monospace',
+                      background: theme.bg, border: `1px solid ${theme.border}`,
+                      borderRadius: 4, display: 'inline-flex', gap: 6,
+                      alignItems: 'baseline',
+                    }}>
+                <span style={{ color: theme.muted }}>#{r.rank}</span>
+                <span style={{ fontWeight: 600, color: theme.text }}>{r.ticker}</span>
+                <span style={{ fontWeight: 600,
+                                color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
+                  {fmtPct(r.return_pct, 1)}
+                </span>
+                {r.rank_delta != null && r.rank_delta !== 0 && (
+                  <span style={{ fontSize: 10,
+                                  color: r.rank_delta > 0 ? '#047857' : '#b91c1c' }}>
+                    {r.rank_delta > 0 ? `▲${r.rank_delta}` : `▼${-r.rank_delta}`}
+                  </span>
+                )}
+                {r.new_entrant && (
+                  <span title="Not in the top-2N a full window ago" style={{
+                    fontSize: 9, fontWeight: 600, fontFamily: 'Inter, sans-serif',
+                    textTransform: 'uppercase', letterSpacing: '0.04em',
+                    color: '#4338ca', background: '#eef2ff',
+                    padding: '1px 5px', borderRadius: 3,
+                  }}>new</span>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {data && data.elapsed_s != null && (
         <div style={{ marginTop: 8, fontSize: 10, color: theme.muted,
