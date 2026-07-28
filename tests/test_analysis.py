@@ -308,6 +308,65 @@ def test_top_performers_streak_counts_persistent_winner():
     assert r0["streak"] == 12  # capped at 12 prior windows
 
 
+def test_top_performers_streak_stops_at_data_edge():
+    # Only ~100 days of history: prior windows anchored 3+ steps back can't
+    # reach their target start within the 10-day tolerance, so the streak
+    # stops counting instead of ranking on a collapsed window.
+    end = pd.Timestamp("2026-07-01")
+    idx = pd.date_range(end - pd.Timedelta(days=99), end)
+    n = len(idx)
+    cols = {"T0": 100 * np.exp(np.linspace(0, 1, n))}
+    for i in range(1, 5):
+        cols[f"T{i}"] = np.full(n, 100.0) + i
+    prices = pd.DataFrame(cols, index=idx)
+    rows = analysis.top_performers_period(prices, top_n=2, days=30)
+    r0 = next(r for r in rows if r["ticker"] == "T0")
+    assert r0["streak"] == 2
+
+
+def test_event_study_summary_falls_back_when_benchmark_has_no_coverage():
+    # Every bench_return NaN at this horizon -> legacy full-sample-mean spread,
+    # never NaN alpha/win_rate (which would 500 the JSON response).
+    rows = [{"cohort": i, "h": 1, "mean_return": 0.02, "median_return": 0.0,
+             "bench_return": np.nan} for i in range(10)]
+    bench = pd.Series([0.01] * 24)
+    summ = analysis.event_study_summary(pd.DataFrame(rows), bench)
+    assert abs(summ.loc[1, "alpha_vs_bench"] - (0.02 - 0.01)) < 1e-12
+    assert abs(summ.loc[1, "win_rate"] - 1.0) < 1e-12
+
+
+def test_watchlist_new_entrant_covers_displayed_region():
+    idx = pd.bdate_range("2025-06-01", "2026-07-01")
+    n = len(idx)
+    cols = {f"T{i}": 100 * np.exp(np.linspace(0, 0.30 - 0.01 * i, n)) for i in range(28)}
+    burst = np.full(n, 100.0)
+    burst[-10:] = 100 * np.exp(np.linspace(0, 0.5, 10))
+    cols["JUMP"] = burst
+    prices = pd.DataFrame(cols, index=idx)
+    rows = analysis.top_performers_period(prices, top_n=3, days=30, watch_n=5)
+    # T6 sits stationary around rank 8 in both windows — inside the displayed
+    # region, so not NEW (a 2N=6 reference would have flagged it forever).
+    t6 = next(r for r in rows if r["ticker"] == "T6")
+    assert t6["new_entrant"] is False
+    jump = next(r for r in rows if r["ticker"] == "JUMP")
+    assert jump["new_entrant"] is True
+
+
+def test_pick_quality_stats_ignore_gap_crossing_returns():
+    end = pd.Timestamp("2026-07-01")
+    idx = pd.date_range(end - pd.Timedelta(days=120), end)
+    flat = pd.Series(100.0, index=idx)
+    gappy = flat.copy()
+    gappy.iloc[-20:] = 130.0          # +30% level shift...
+    gappy.iloc[-25:-20] = np.nan      # ...hidden inside a 5-day data gap
+    others = {f"T{i}": flat * (1 + 0.0001 * (i + 1)) for i in range(4)}
+    prices = pd.DataFrame({"GAPPY": gappy, **others})
+    rows = analysis.top_performers_period(prices, top_n=2, days=60)
+    g = next(r for r in rows if r["ticker"] == "GAPPY")
+    # The +30% move across the gap must not be reported as a 1-day move.
+    assert abs(g["max_day_move"]) < 1e-9
+
+
 def test_top_performers_watchlist_and_new_entrants():
     idx = pd.bdate_range("2025-01-01", "2026-07-01")
     n = len(idx)
@@ -356,6 +415,17 @@ def test_recent_picks_attribution_sums_to_cohort_mean():
                 assert pd.isna(expected)
             else:
                 assert abs(v - expected) < 1e-12
+
+
+def test_live_rebalance_flags_partial_forward_month():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=3)  # ends mid-month
+    monthly = datalib.to_monthly_returns(prices)
+    reb = analysis.live_rebalance(prices, monthly, top_n=3, rank_lookback=1)
+    newest_completed = reb[1]
+    assert newest_completed["fwd_partial"] is True
+    assert newest_completed["fwd_as_of"] == prices.index.max().strftime("%Y-%m-%d")
+    # Older rows are fully realized — no flag.
+    assert all("fwd_partial" not in r for r in reb[2:])
 
 
 def test_rebalance_schedule_attribution_on_completed_rows_only():

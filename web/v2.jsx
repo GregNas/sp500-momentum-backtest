@@ -669,12 +669,15 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                                       fontFamily: 'JetBrains Mono, monospace' }}>
                         {c.month}
                       </span>
-                      <span style={{
+                      <span title={c.fwd_partial
+                              ? 'Month-to-date — the forward month is still in progress'
+                              : undefined}
+                            style={{
                         fontSize: 11, fontWeight: 600,
                         fontFamily: 'JetBrains Mono, monospace',
                         color: c.return_pct >= 0 ? '#047857' : '#b91c1c',
                       }}>
-                        {fmtPct(c.return_pct, 1)}
+                        {fmtPct(c.return_pct, 1)}{c.fwd_partial ? ' MTD' : ''}
                       </span>
                     </div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>

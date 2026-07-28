@@ -135,15 +135,23 @@ def event_study_summary(events: pd.DataFrame, benchmark_monthly: pd.Series) -> p
     rows: dict[int, dict] = {}
     for h, grp in events.groupby("h"):
         s = grp["mean_return"]
+        use_aligned = aligned
         if aligned:
             valid = grp.dropna(subset=["bench_return"])
+            # A benchmark whose history doesn't cover this horizon at all
+            # would make the aligned stats NaN — fall back to the legacy
+            # full-sample-mean spread instead.
+            use_aligned = len(valid) > 0
+        if use_aligned:
             spread = valid["mean_return"] - valid["bench_return"]
+            win_rate = (spread > 0).mean()
         else:
             spread = s - bench_mean
+            win_rate = (s > 0).mean()
         rows[int(h)] = {
             "avg_return":     s.mean(),
             "median_return":  s.median(),
-            "win_rate":       (spread > 0).mean() if aligned else (s > 0).mean(),
+            "win_rate":       win_rate,
             "std":            s.std(),
             "n_cohorts":      int(s.count()),
             "benchmark_avg":  bench_mean,
@@ -297,13 +305,18 @@ def _window_return_top_set(
     prices: pd.DataFrame, end_ts: pd.Timestamp, days: int, top_n: int,
 ) -> set | None:
     """The top_n ticker set by simple return over the `days` window ending at
-    the last bar at-or-before `end_ts`, or None when the window can't be formed."""
+    the last bar at-or-before `end_ts`, or None when the window can't be
+    formed — including when history stops so short of the target start that
+    the "same-length" window would silently collapse to a fraction of `days`
+    (same 10-day reach-back tolerance as the trailing-return stats)."""
     upto = prices.loc[prices.index <= end_ts]
     if upto.empty:
         return None
     actual_end = upto.index[-1]
-    from_start = prices.loc[prices.index >= actual_end - pd.Timedelta(days=days)]
-    if from_start.empty or from_start.index[0] >= actual_end:
+    target_start = actual_end - pd.Timedelta(days=days)
+    from_start = prices.loc[prices.index >= target_start]
+    if (from_start.empty or from_start.index[0] >= actual_end
+            or (from_start.index[0] - target_start).days > 10):
         return None
     r = (upto.iloc[-1] / from_start.iloc[0] - 1).dropna()
     if r.empty:
@@ -316,8 +329,11 @@ def _pick_quality_stats(col: pd.Series, start_ts, end_ts) -> dict:
     52-week-high proximity, trailing returns, and a weekly sparkline. Fields
     are None when the ticker's history doesn't reach far enough back."""
     end_price = float(col.loc[end_ts])
-    window = col.loc[start_ts:end_ts].dropna()
-    daily = window.pct_change().dropna()
+    # pct_change on the raw (gappy) series: a return across missing bars comes
+    # out NaN and is excluded, instead of a multi-day move masquerading as a
+    # single-day one (which would inflate vol_ann and fake a max_day_move).
+    window = col.loc[start_ts:end_ts]
+    daily = window.pct_change(fill_method=None).dropna()
     out: dict = {
         "vol_ann": float(daily.std() * np.sqrt(252)) if len(daily) >= 5 else None,
         "max_day_move": (float(daily.iloc[int(np.argmax(np.abs(daily.values)))])
@@ -363,7 +379,8 @@ def top_performers_period(
     the ticker already ranked in the top_n (capped at 12) — signal persistence.
     ``prior_rank`` is the ticker's rank over the same-length window ending at
     the last bar ≥ 7 calendar days earlier (rank velocity); ``new_entrant`` is
-    True when the ticker was absent from the top-2N set one full window back.
+    True when the ticker was absent one full window back from the top
+    ``max(2N, N + watch_n)`` — i.e. it wasn't anywhere in the displayed region.
     Context fields are None where the cached history doesn't reach back far
     enough (e.g. a fetch window shorter than a year).
     """
@@ -394,9 +411,12 @@ def top_performers_period(
                                    days=days, top_n=top_n)
         )
 
-    # NEW-entrant reference: the top-2N set one full window back.
-    prev_top2n = _window_return_top_set(
-        prices, end_ts - pd.Timedelta(days=days), days=days, top_n=top_n * 2,
+    # NEW-entrant reference: one full window back, wide enough to cover the
+    # whole displayed region (leaderboard + watchlist) — otherwise a name
+    # sitting stationary just past 2N would be flagged NEW on every refresh.
+    ref_top_n = max(top_n * 2, top_n + max(0, watch_n))
+    prev_top_ref = _window_return_top_set(
+        prices, end_ts - pd.Timedelta(days=days), days=days, top_n=ref_top_n,
     )
 
     # Full-universe ranks over the same-length window ending ≥ 7 days earlier,
@@ -429,8 +449,8 @@ def top_performers_period(
             "prior_rank": (int(prior_ranks[ticker])
                            if prior_ranks is not None and ticker in prior_ranks.index
                            else None),
-            "new_entrant": ((ticker not in prev_top2n)
-                            if prev_top2n is not None else None),
+            "new_entrant": ((ticker not in prev_top_ref)
+                            if prev_top_ref is not None else None),
             **_pick_quality_stats(prices[ticker], start_ts, end_ts),
         })
     return rows
@@ -521,6 +541,15 @@ def live_rebalance(
     if len(monthly_returns.index) and prices.index.max() < monthly_returns.index[-1]:
         partial_month = monthly_returns.index[-1].strftime("%Y-%m")
     completed = [row for row in history if row["month"] != partial_month]
+
+    # The newest completed row's forward month is the in-progress month, so its
+    # realized return is month-to-date, not a full month — flag it so the UI
+    # and CSV don't present it as final.
+    if partial_month and completed and len(monthly_returns.index) >= 2:
+        prev_label = monthly_returns.index[-2].strftime("%Y-%m")
+        if completed[0]["month"] == prev_label and "return_pct" in completed[0]:
+            completed[0]["fwd_partial"] = True
+            completed[0]["fwd_as_of"] = prices.index.max().strftime("%Y-%m-%d")
 
     prev = completed[0]["picks"] if completed else []
     prev_set = set(prev)

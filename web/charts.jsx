@@ -855,11 +855,13 @@ function RebalanceHistoryRow({ r, theme }) {
           {r.holds.length} kept
         </span>
         {r.return_pct != null && (
-          <span title="Equal-weight return of this month's picks over the following month"
+          <span title={r.fwd_partial
+                  ? `Month-to-date through ${r.fwd_as_of || 'the latest bar'} — the following month is still in progress`
+                  : "Equal-weight return of this month's picks over the following month"}
                 style={{ fontSize: 10.5, fontWeight: 600, flexShrink: 0,
                          fontFamily: 'JetBrains Mono, monospace',
                          color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
-            → {fmtPct(r.return_pct, 1)}
+            → {fmtPct(r.return_pct, 1)}{r.fwd_partial ? ' MTD' : ''}
           </span>
         )}
         {hasAttr && (
@@ -906,11 +908,12 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
   const downloadCsv = () => {
     const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
     const fwd = (r, t) => (r.pick_returns?.[t] != null ? (r.pick_returns[t] * 100).toFixed(2) : '');
-    const rows = [['month', 'action', 'ticker', 'group', 'fwd_return_pct']];
+    const fwdStatus = (r, t) => (r.pick_returns?.[t] != null ? (r.fwd_partial ? 'mtd' : 'final') : '');
+    const rows = [['month', 'action', 'ticker', 'group', 'fwd_return_pct', 'fwd_status']];
     rebalance.forEach(r => {
-      r.buys.forEach(t => rows.push([r.month, 'BUY', t, r.meta?.[t] || '', fwd(r, t)]));
-      r.sells.forEach(t => rows.push([r.month, 'SELL', t, r.meta?.[t] || '', '']));
-      r.holds.forEach(t => rows.push([r.month, 'KEEP', t, r.meta?.[t] || '', fwd(r, t)]));
+      r.buys.forEach(t => rows.push([r.month, 'BUY', t, r.meta?.[t] || '', fwd(r, t), fwdStatus(r, t)]));
+      r.sells.forEach(t => rows.push([r.month, 'SELL', t, r.meta?.[t] || '', '', '']));
+      r.holds.forEach(t => rows.push([r.month, 'KEEP', t, r.meta?.[t] || '', fwd(r, t), fwdStatus(r, t)]));
     });
     const csv = rows.map(r => r.map(q).join(',')).join('\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -1026,6 +1029,7 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
 // momentum profile.
 function leaderboardBadge(r) {
   if (r.max_day_move != null && r.return_pct != null
+      && r.max_day_move * r.return_pct > 0   // the big session must drive the move, not oppose it
       && Math.abs(r.max_day_move) >= 0.05
       && Math.abs(r.max_day_move) >= 0.5 * Math.abs(r.return_pct)) {
     return { label: 'spike', color: '#b45309', bg: '#fef3c7',
@@ -1072,6 +1076,7 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
     setTopN(n);
     setData(null);
     setError(null);
+    setSort(null);
     if (mounted.current && cacheInfo) refresh(n, days);
     mounted.current = true;
   }, [universe]);
@@ -1327,7 +1332,7 @@ function TopPerformersPanel({ theme, accent, headingFont, universe = 'sp500', ca
                   </span>
                 )}
                 {r.new_entrant && (
-                  <span title="Not in the top-2N a full window ago" style={{
+                  <span title="Wasn't anywhere in this list a full window ago" style={{
                     fontSize: 9, fontWeight: 600, fontFamily: 'Inter, sans-serif',
                     textTransform: 'uppercase', letterSpacing: '0.04em',
                     color: '#4338ca', background: '#eef2ff',

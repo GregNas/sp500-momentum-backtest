@@ -210,8 +210,8 @@ def _run_backtest(params: BacktestParams) -> dict:
         event_study_rows.append({
             "h": int(h_idx),
             "avg_return": float(row["avg_return"]),
-            "win_rate": float(row["win_rate"]),
-            "alpha": float(row["alpha_vs_bench"]),
+            "win_rate": float(row["win_rate"]) if not pd.isna(row["win_rate"]) else 0.0,
+            "alpha": float(row["alpha_vs_bench"]) if not pd.isna(row["alpha_vs_bench"]) else 0.0,
             "t_stat": float(row["t_stat"]) if not pd.isna(row["t_stat"]) else 0.0,
             "n": int(row["n_cohorts"]),
         })
@@ -220,6 +220,11 @@ def _run_backtest(params: BacktestParams) -> dict:
         monthly, top_n=params.topN, rank_lookback=params.rankLookback, n_cohorts=6,
         skip_months=params.skipMonths,
     )
+    # The newest cohort's forward month may still be in progress — its
+    # return_pct/pick_returns are then month-to-date, so flag it for the UI.
+    if (len(monthly.index) >= 2 and constituents.index.max() < monthly.index[-1]
+            and cohorts and cohorts[0]["month"] == monthly.index[-2].strftime("%Y-%m")):
+        cohorts[0]["fwd_partial"] = True
 
     # ---- Rolling Sharpe (12m) for each strategy + benchmark ----
     rolling_sharpe_out: dict = {"months": months_iso}
@@ -336,7 +341,7 @@ def _top_performers(params: TopPerformersParams) -> dict:
         raise HTTPException(status_code=502, detail=f"Data fetch failed: {exc}")
 
     # "Bubbling under": the next ~10 ranks past the leaderboard cutoff.
-    watch_n = min(10, max(0, len(tickers) - params.topN - 1))
+    watch_n = min(10, max(0, len(tickers) - params.topN))
     results = analysis.top_performers_period(
         prices, top_n=params.topN, days=params.days, watch_n=watch_n,
     )
