@@ -9,11 +9,39 @@ import numpy as np
 import pandas as pd
 
 
+def momentum_signal(
+    monthly_returns: pd.DataFrame,
+    rank_lookback: int,
+    skip_months: int = 0,
+) -> pd.DataFrame:
+    """The ranking signal: trailing ``rank_lookback``-month compounded return,
+    optionally ending ``skip_months`` before the formation month.
+
+    Row t holds the compounded return over the window
+    ``(t - skip_months - rank_lookback, t - skip_months]``. ``skip_months=0``
+    is the plain trailing return; ``skip_months=1`` with ``rank_lookback=11``
+    is the classic "12-1" momentum spec, which drops the most recent month to
+    sidestep 1-month reversal.
+
+    Every ranking consumer (event study, backtest, cohorts, rebalance schedule,
+    sector breakdown) must source its signal here so signal changes propagate
+    to all of them consistently.
+    """
+    if rank_lookback == 1:
+        signal = monthly_returns
+    else:
+        signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    if skip_months:
+        signal = signal.shift(skip_months)
+    return signal
+
+
 def event_study(
     monthly_returns: pd.DataFrame,
     top_n: int,
     rank_lookback: int,
     horizon: int,
+    skip_months: int = 0,
 ) -> pd.DataFrame:
     """For every month t, identify top_n stocks by trailing rank_lookback return,
     then record their average return at t+1, t+2, ..., t+horizon.
@@ -22,12 +50,9 @@ def event_study(
     """
     rows = []
 
-    if rank_lookback == 1:
-        ranking_signal = monthly_returns
-    else:
-        ranking_signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
-    for i in range(rank_lookback - 1, len(monthly_returns) - horizon):
+    for i in range(rank_lookback - 1 + skip_months, len(monthly_returns) - horizon):
         cohort_date = monthly_returns.index[i]
         ranking = ranking_signal.iloc[i].dropna()
         if len(ranking) < top_n:
@@ -113,23 +138,21 @@ def momentum_backtest(
     top_n: int,
     hold_period: int,
     rank_lookback: int,
+    skip_months: int = 0,
 ) -> pd.Series:
     """Jegadeesh-Titman: K overlapping equal-weight portfolios, each rebalanced
     every K months. Each month's strategy return = average return of the K
     currently-active portfolios.
     """
-    if rank_lookback == 1:
-        signal = monthly_returns
-    else:
-        signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
     returns = []
     dates = []
-    for t in range(rank_lookback, len(monthly_returns)):
+    for t in range(rank_lookback + skip_months, len(monthly_returns)):
         sleeve_returns = []
         for k in range(hold_period):
             select_t = t - 1 - k
-            if select_t < rank_lookback - 1:
+            if select_t < rank_lookback - 1 + skip_months:
                 continue
             ranking = signal.iloc[select_t].dropna()
             if len(ranking) < top_n:
@@ -154,20 +177,18 @@ def recent_picks(
     top_n: int,
     rank_lookback: int,
     n_cohorts: int = 6,
+    skip_months: int = 0,
 ) -> list[dict]:
     """Last `n_cohorts` cohorts that have a realized 1-month forward return.
 
     Each entry: {month: 'YYYY-MM', picks: [tickers], return_pct: float}.
     Newest cohort first.
     """
-    if rank_lookback == 1:
-        ranking_signal = monthly_returns
-    else:
-        ranking_signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
     out: list[dict] = []
     last_realized_idx = len(monthly_returns) - 2  # need t+1 to exist
-    for i in range(last_realized_idx, rank_lookback - 2, -1):
+    for i in range(last_realized_idx, rank_lookback - 2 + skip_months, -1):
         if len(out) >= n_cohorts:
             break
         ranking = ranking_signal.iloc[i].dropna()
@@ -190,6 +211,7 @@ def rebalance_schedule(
     top_n: int,
     rank_lookback: int,
     n_months: int = 13,
+    skip_months: int = 0,
 ) -> list[dict]:
     """Month-by-month trade list for a fully rebalanced top-N portfolio
     (the 1-month-hold sleeve): what enters, what exits, what stays.
@@ -199,10 +221,7 @@ def rebalance_schedule(
     actionable trade list. Each entry, newest first:
     {month: 'YYYY-MM', buys: [...], sells: [...], holds: [...]}.
     """
-    if rank_lookback == 1:
-        ranking_signal = monthly_returns
-    else:
-        ranking_signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
     picks_cache: dict[int, list | None] = {}
 
@@ -289,6 +308,7 @@ def current_target(
     prices: pd.DataFrame,
     top_n: int,
     rank_lookback: int,
+    skip_months: int = 0,
 ) -> dict | None:
     """The momentum portfolio *as of the latest price bar*.
 
@@ -299,17 +319,28 @@ def current_target(
     matching settings, instead of ranking on a 1-3 trading-day partial calendar
     month right after a month-end.
 
-    Returns ``{tickers, as_of, start_date, days}`` (tickers ordered by return,
-    highest first), or ``None`` when there isn't enough price data.
+    With ``skip_months > 0`` the ranking window ends that many months *before*
+    the latest bar (the daily-frequency mirror of :func:`momentum_signal`'s
+    skip); ``as_of`` still reports the latest bar the target is current as of.
+
+    Returns ``{tickers, as_of, start_date, signal_end, days}`` (tickers ordered
+    by return, highest first), or ``None`` when there isn't enough price data.
     """
+    if prices.empty:
+        return None
     days = round(rank_lookback * _MONTH_DAYS)
-    ranked = top_performers_period(prices, top_n=top_n, days=days)
+    window = prices
+    if skip_months:
+        cutoff = prices.index.max() - pd.Timedelta(days=round(skip_months * _MONTH_DAYS))
+        window = prices.loc[prices.index <= cutoff]
+    ranked = top_performers_period(window, top_n=top_n, days=days)
     if not ranked:
         return None
     return {
         "tickers": [r["ticker"] for r in ranked],
-        "as_of": ranked[0]["end_date"],
+        "as_of": prices.index.max().strftime("%Y-%m-%d"),
         "start_date": ranked[0]["start_date"],
+        "signal_end": ranked[0]["end_date"],
         "days": days,
     }
 
@@ -320,6 +351,7 @@ def live_rebalance(
     top_n: int,
     rank_lookback: int,
     n_months: int = 13,
+    skip_months: int = 0,
 ) -> list[dict]:
     """Rebalance trade list for the dashboard: a live "as of today" target row
     on top, followed by the completed month-end rebalance rows.
@@ -335,8 +367,11 @@ def live_rebalance(
     """
     history = rebalance_schedule(
         monthly_returns, top_n=top_n, rank_lookback=rank_lookback, n_months=n_months,
+        skip_months=skip_months,
     )
-    live = current_target(prices, top_n=top_n, rank_lookback=rank_lookback)
+    live = current_target(
+        prices, top_n=top_n, rank_lookback=rank_lookback, skip_months=skip_months,
+    )
     if live is None:
         return history
 
@@ -387,18 +422,16 @@ def cohort_sector_breakdown(
     rank_lookback: int,
     sector_map: dict[str, str],
     n_cohorts: int = 12,
+    skip_months: int = 0,
 ) -> list[dict]:
     """For the last `n_cohorts` cohorts, count picks per GICS sector.
 
     Returns newest-first list of {month: 'YYYY-MM', sectors: {sector: count}}.
     """
-    if rank_lookback == 1:
-        ranking_signal = monthly_returns
-    else:
-        ranking_signal = (1 + monthly_returns).rolling(rank_lookback).apply(np.prod) - 1
+    ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
     out: list[dict] = []
-    for i in range(len(monthly_returns) - 1, rank_lookback - 2, -1):
+    for i in range(len(monthly_returns) - 1, rank_lookback - 2 + skip_months, -1):
         if len(out) >= n_cohorts:
             break
         ranking = ranking_signal.iloc[i].dropna()

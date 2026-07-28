@@ -682,6 +682,7 @@ const PARAM_HELP = {
   topN: 'How many of the highest-momentum names go into the portfolio each month.',
   holds: 'How long each monthly cohort is held, in months. Multiple selections run as parallel sleeves.',
   rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
+  skipMonths: 'Months skipped between the ranking window and formation — the window ends this many months before the pick. 1 dodges short-term reversal (classic 12-1 momentum = rank lookback 11 + skip 1).',
   horizon: 'How many months forward the event study tracks each cohort after selection.',
   benchmark: 'Ticker the strategy is measured against.',
   riskFree: 'Annual risk-free rate (%) subtracted from returns when computing the Sharpe ratio.',
@@ -693,6 +694,7 @@ const DEFAULT_RANGES = {
   lookback: { min: 1, max: 25 },
   topN: { min: 1, max: 100 },
   rankLookback: { min: 1, max: 12 },
+  skipMonths: { min: 0, max: 2 },
   horizon: { min: 1, max: 24 },
 };
 
@@ -712,9 +714,11 @@ function paramIssues(params, universesInfo) {
     const v = params[key];
     if (!Number.isFinite(v) || v < min || v > max) issues.push(`${label} must be ${min}–${max}`);
   };
+  const skipRange = ranges.skipMonths || DEFAULT_RANGES.skipMonths;
   check('lookback', 'Lookback', ranges.lookback.min, ranges.lookback.max);
   check('topN', 'Top N', ranges.topN.min, topNMax);
   check('rankLookback', 'Rank lookback', ranges.rankLookback.min, ranges.rankLookback.max);
+  check('skipMonths', 'Skip months', skipRange.min, skipRange.max);
   check('horizon', 'Event horizon', ranges.horizon.min, ranges.horizon.max);
   if (!params.benchmark || !String(params.benchmark).trim()) issues.push('Benchmark ticker is required');
   return issues;
@@ -809,7 +813,7 @@ function RebalanceChip({ ticker, group, kind, theme, showGroup }) {
   );
 }
 
-function RebalancePanel({ rebalance, topN, rankLookback, universe = 'sp500',
+function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, universe = 'sp500',
                           theme, accent, headingFont }) {
   if (!rebalance || !rebalance.length) return null;
   const latest = rebalance[0];
@@ -854,10 +858,9 @@ function RebalancePanel({ rebalance, topN, rankLookback, universe = 'sp500',
             Monthly rebalance · trade list
           </div>
           <div style={{ fontSize: 11, color: theme.muted, marginTop: 2, lineHeight: 1.5 }}>
-            Hold the top {topN} by trailing {rankLookback}m return; rebalance in full at each
+            Hold the top {topN} by trailing {rankLookback}m return{skipMonths > 0 ? ` (window ends ${skipMonths}m before formation)` : ''}; rebalance in full at each
             month-end close (the 1-month-hold sleeve). The top row is the live target as of
-            the latest price — ranked over a trailing {rankLookback}-month window ending today,
-            the same signal as Top performers. History rows below are the month-end sleeve.
+            the latest price — ranked over a trailing {rankLookback}-month window ending {skipMonths > 0 ? `${skipMonths}m back` : 'today'}{skipMonths > 0 ? '' : ', the same signal as Top performers'}. History rows below are the month-end sleeve.
           </div>
         </div>
         <button onClick={downloadCsv} style={{

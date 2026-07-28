@@ -115,6 +115,58 @@ def test_calendar_year_returns_empty():
     assert analysis.calendar_year_returns(pd.Series(dtype=float)) == []
 
 
+# ---- momentum_signal: shared ranking-signal builder + skip-month ----
+
+def _monthly_frame(n_months=30, n_tickers=8, seed=7):
+    idx = _months(n_months)
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(rng.normal(0.01, 0.06, (n_months, n_tickers)),
+                        index=idx, columns=[f"T{i}" for i in range(n_tickers)])
+
+
+def test_momentum_signal_skip_zero_matches_legacy_formula():
+    r = _monthly_frame()
+    pd.testing.assert_frame_equal(analysis.momentum_signal(r, 1), r)
+    legacy = (1 + r).rolling(6).apply(np.prod) - 1
+    pd.testing.assert_frame_equal(analysis.momentum_signal(r, 6), legacy)
+
+
+def test_momentum_signal_skip_shifts_window():
+    r = _monthly_frame()
+    base = analysis.momentum_signal(r, 3, skip_months=0)
+    skipped = analysis.momentum_signal(r, 3, skip_months=1)
+    pd.testing.assert_frame_equal(skipped, base.shift(1))
+
+
+def test_rebalance_schedule_skip_shifts_picks_one_month():
+    r = _monthly_frame(n_months=18)
+    by_month_0 = {row["month"]: row["picks"]
+                  for row in analysis.rebalance_schedule(r, top_n=3, rank_lookback=2, n_months=99)}
+    by_month_1 = {row["month"]: row["picks"]
+                  for row in analysis.rebalance_schedule(r, top_n=3, rank_lookback=2, n_months=99,
+                                                         skip_months=1)}
+    labels = [d.strftime("%Y-%m") for d in r.index]
+    checked = 0
+    for i in range(1, len(labels)):
+        m, prev = labels[i], labels[i - 1]
+        if m in by_month_1 and prev in by_month_0:
+            assert by_month_1[m] == by_month_0[prev]
+            checked += 1
+    assert checked > 5
+
+
+def test_momentum_backtest_skip_zero_unchanged_and_skip_runs():
+    r = _monthly_frame(n_months=24)
+    base = analysis.momentum_backtest(r, top_n=3, hold_period=1, rank_lookback=2)
+    explicit = analysis.momentum_backtest(r, top_n=3, hold_period=1, rank_lookback=2,
+                                          skip_months=0)
+    pd.testing.assert_series_equal(base, explicit)
+    skipped = analysis.momentum_backtest(r, top_n=3, hold_period=1, rank_lookback=2,
+                                         skip_months=1)
+    assert len(skipped) == len(base) - 1  # one fewer month of valid signal
+    assert skipped.index[0] == base.index[1]
+
+
 # ---- live current target anchored to the run date ----
 
 def _daily_prices(tickers, start="2026-01-01", end="2026-07-02", seed=0):
@@ -145,6 +197,18 @@ def test_current_target_matches_top_performers_signal():
 
 def test_current_target_none_when_empty():
     assert analysis.current_target(pd.DataFrame(), top_n=3, rank_lookback=1) is None
+
+
+def test_current_target_skip_ranks_on_earlier_window():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=5)
+    ct = analysis.current_target(prices, top_n=3, rank_lookback=1, skip_months=1)
+    cutoff = prices.index.max() - pd.Timedelta(days=round(1 * _MONTH_DAYS))
+    truncated = prices.loc[prices.index <= cutoff]
+    tp = analysis.top_performers_period(truncated, top_n=3, days=round(1 * _MONTH_DAYS))
+    assert ct["tickers"] == [r["ticker"] for r in tp]
+    # The target is still "as of" the latest bar; only the signal window moved back.
+    assert ct["as_of"] == prices.index.max().strftime("%Y-%m-%d")
+    assert ct["signal_end"] == truncated.index.max().strftime("%Y-%m-%d")
 
 
 def test_rebalance_schedule_exposes_picks():

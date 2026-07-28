@@ -38,6 +38,7 @@ class BacktestParams(BaseModel):
     topN: int = Field(10, ge=1, le=100)
     holds: List[int] = Field(default_factory=lambda: [1, 3, 6])
     rankLookback: int = Field(1, ge=1, le=12)
+    skipMonths: int = Field(0, ge=0, le=2)  # gap between ranking window and formation
     horizon: int = Field(12, ge=1, le=24)
     benchmark: str = "SPY"
     riskFree: float = Field(0.0, ge=0.0, le=0.2)  # annual risk-free rate for Sharpe
@@ -140,6 +141,7 @@ def _run_backtest(params: BacktestParams) -> dict:
     # ---- Event study ----
     events = analysis.event_study(
         monthly, top_n=params.topN, rank_lookback=params.rankLookback, horizon=params.horizon,
+        skip_months=params.skipMonths,
     )
     summary = analysis.event_study_summary(events, benchmark_monthly)
 
@@ -148,6 +150,7 @@ def _run_backtest(params: BacktestParams) -> dict:
     for h in params.holds:
         r = analysis.momentum_backtest(
             monthly, top_n=params.topN, hold_period=h, rank_lookback=params.rankLookback,
+            skip_months=params.skipMonths,
         )
         strategy_returns[h] = r
 
@@ -215,6 +218,7 @@ def _run_backtest(params: BacktestParams) -> dict:
 
     cohorts = analysis.recent_picks(
         monthly, top_n=params.topN, rank_lookback=params.rankLookback, n_cohorts=6,
+        skip_months=params.skipMonths,
     )
 
     # ---- Rolling Sharpe (12m) for each strategy + benchmark ----
@@ -236,6 +240,7 @@ def _run_backtest(params: BacktestParams) -> dict:
         rank_lookback=params.rankLookback,
         sector_map=sector_map,
         n_cohorts=12,
+        skip_months=params.skipMonths,
     )
 
     # Attach group labels to recent picks for ETF-universe chips.
@@ -251,6 +256,7 @@ def _run_backtest(params: BacktestParams) -> dict:
     rebalance = analysis.live_rebalance(
         constituents, monthly, top_n=params.topN,
         rank_lookback=params.rankLookback, n_months=13,
+        skip_months=params.skipMonths,
     )
     for r in rebalance:
         tickers_in_row = set(r["buys"]) | set(r["sells"]) | set(r["holds"])
@@ -381,6 +387,7 @@ def universe_info() -> dict:
             "lookback": {"min": 1, "max": 25},
             "topN": {"min": 1, "max": 100},
             "rankLookback": {"min": 1, "max": 12},
+            "skipMonths": {"min": 0, "max": 2},
             "horizon": {"min": 1, "max": 24},
         },
         "universes": {},

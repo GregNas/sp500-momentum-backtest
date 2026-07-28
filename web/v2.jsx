@@ -137,6 +137,11 @@ function V2Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                 onChange={v => setParam('rankLookback', v)}
                 theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
 
+      <NumField id="v2-skip" label="Skip months" value={params.skipMonths}
+                min={0} max={2} help={PARAM_HELP.skipMonths}
+                onChange={v => setParam('skipMonths', v)}
+                theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+
       <NumField id="v2-horizon" label="Event horizon" value={params.horizon}
                 min={1} max={24} help={PARAM_HELP.horizon}
                 onChange={v => setParam('horizon', v)}
@@ -385,7 +390,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                 Do winners keep winning?
               </div>
               <div style={{ fontSize: 13, color: v2Theme.muted, marginTop: 2 }}>
-                Top {params.topN} {UNIVERSE_NOUN[params.universe] || 'names'} by prior {params.rankLookback}-month return,
+                Top {params.topN} {UNIVERSE_NOUN[params.universe] || 'names'} by prior {params.rankLookback}-month return{params.skipMonths > 0 ? ` (skip ${params.skipMonths}m)` : ''},
                 equal-weighted, held {params.holds.join('/')} months.
               </div>
             </div>
@@ -706,6 +711,7 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
           {/* Monthly rebalance trade list */}
           <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}
                           rankLookback={params.rankLookback}
+                          skipMonths={params.skipMonths || 0}
                           universe={params.universe || 'sp500'}
                           theme={v2Theme} accent={v2Accent}
                           headingFont='"Source Serif Pro", Georgia, serif' />

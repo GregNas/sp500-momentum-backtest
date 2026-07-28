@@ -116,6 +116,12 @@ function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                   theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
                   wrapStyle={{ marginBottom: 12 }} />
 
+        <NumField id="v1-skip" label="Skip months" value={params.skipMonths}
+                  min={0} max={2} help={PARAM_HELP.skipMonths}
+                  onChange={v => setParam('skipMonths', v)}
+                  theme={v1Theme} labelStyle={labelStyle} inputStyle={inputBase}
+                  wrapStyle={{ marginBottom: 12 }} />
+
         <NumField id="v1-horizon" label="Event horizon" value={params.horizon}
                   min={1} max={24} help={PARAM_HELP.horizon}
                   onChange={v => setParam('horizon', v)}
@@ -334,7 +340,7 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
               </div>
               <div style={{ fontSize: 12, color: v1Theme.muted, marginTop: 4,
                              fontFamily: 'JetBrains Mono, monospace' }}>
-                {monthRangeStr} · ranked on prior {params.rankLookback}m return · equal-weight
+                {monthRangeStr} · ranked on prior {params.rankLookback}m return{params.skipMonths > 0 ? ` (skip ${params.skipMonths}m)` : ''} · equal-weight
               </div>
             </div>
             <div role="status" aria-live="polite"
@@ -599,6 +605,7 @@ function V1Dashboard({ params, setParam, data, status, running, error, elapsed,
           {/* Monthly rebalance trade list */}
           <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}
                           rankLookback={params.rankLookback}
+                          skipMonths={params.skipMonths || 0}
                           universe={params.universe || 'sp500'}
                           theme={v1Theme} accent={v1Accent} />
 
