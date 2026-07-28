@@ -813,6 +813,89 @@ function RebalanceChip({ ticker, group, kind, theme, showGroup }) {
   );
 }
 
+// One collapsed history row: month, buy/sell chips, kept count, realized-return
+// badge — expands on click to the per-pick forward returns (worst flagged).
+function RebalanceHistoryRow({ r, theme }) {
+  const [open, setOpen] = useState(false);
+  const hasAttr = r.pick_returns && Object.keys(r.pick_returns).length > 0;
+  const chipWrap = { display: 'flex', flexWrap: 'wrap', gap: 4 };
+
+  const entries = hasAttr
+    ? r.picks.map(t => ({ ticker: t, ret: r.pick_returns[t] }))
+        .sort((a, b) => ((b.ret ?? -Infinity) - (a.ret ?? -Infinity)))
+    : [];
+  const worst = entries.reduce(
+    (w, e) => (e.ret != null && (w == null || e.ret < w.ret) ? e : w), null);
+
+  return (
+    <div style={{ borderTop: `1px solid ${theme.border}` }}>
+      <div role={hasAttr ? 'button' : undefined}
+           tabIndex={hasAttr ? 0 : undefined}
+           aria-expanded={hasAttr ? open : undefined}
+           onClick={hasAttr ? () => setOpen(o => !o) : undefined}
+           onKeyDown={hasAttr ? (e) => {
+             if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o); }
+           } : undefined}
+           style={{
+             display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap',
+             padding: '7px 0', cursor: hasAttr ? 'pointer' : 'default', outline: 'none',
+           }}>
+        <span style={{ fontSize: 11, fontWeight: 600, width: 56, flexShrink: 0,
+                        fontFamily: 'JetBrains Mono, monospace' }}>
+          {r.month}
+        </span>
+        <div style={{ ...chipWrap, flex: 1, minWidth: 220 }}>
+          {r.buys.map(t => <RebalanceChip key={`b-${t}`} ticker={t} kind="buy"
+            group={r.meta?.[t]} theme={theme} showGroup={false} />)}
+          {r.sells.map(t => <RebalanceChip key={`s-${t}`} ticker={t} kind="sell"
+            group={r.meta?.[t]} theme={theme} showGroup={false} />)}
+        </div>
+        <span style={{ fontSize: 10.5, color: theme.muted, flexShrink: 0,
+                        fontFamily: 'JetBrains Mono, monospace' }}>
+          {r.holds.length} kept
+        </span>
+        {r.return_pct != null && (
+          <span title="Equal-weight return of this month's picks over the following month"
+                style={{ fontSize: 10.5, fontWeight: 600, flexShrink: 0,
+                         fontFamily: 'JetBrains Mono, monospace',
+                         color: r.return_pct >= 0 ? '#047857' : '#b91c1c' }}>
+            → {fmtPct(r.return_pct, 1)}
+          </span>
+        )}
+        {hasAttr && (
+          <span aria-hidden="true"
+                style={{ fontSize: 10, color: theme.muted, flexShrink: 0 }}>
+            {open ? '▾' : '▸'}
+          </span>
+        )}
+      </div>
+      {open && hasAttr && (
+        <div style={{ padding: '0 0 10px 66px', display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {entries.map(e => {
+            const isWorst = worst && e.ticker === worst.ticker && e.ret != null && e.ret < 0;
+            return (
+              <span key={e.ticker} style={{
+                padding: '2px 7px', fontSize: 10.5,
+                fontFamily: 'JetBrains Mono, monospace',
+                background: isWorst ? '#fef2f2' : theme.bg,
+                border: `1px solid ${isWorst ? '#fecaca' : theme.border}`,
+                borderRadius: 4, display: 'inline-flex', gap: 5, alignItems: 'baseline',
+              }}>
+                <span style={{ fontWeight: 600, color: theme.text }}>{e.ticker}</span>
+                <span style={{ fontWeight: 600,
+                                color: e.ret == null ? theme.muted
+                                  : (e.ret >= 0 ? '#047857' : '#b91c1c') }}>
+                  {e.ret == null ? 'n/a' : fmtPct(e.ret, 1)}
+                </span>
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, universe = 'sp500',
                           theme, accent, headingFont }) {
   if (!rebalance || !rebalance.length) return null;
@@ -822,11 +905,12 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
 
   const downloadCsv = () => {
     const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
-    const rows = [['month', 'action', 'ticker', 'group']];
+    const fwd = (r, t) => (r.pick_returns?.[t] != null ? (r.pick_returns[t] * 100).toFixed(2) : '');
+    const rows = [['month', 'action', 'ticker', 'group', 'fwd_return_pct']];
     rebalance.forEach(r => {
-      r.buys.forEach(t => rows.push([r.month, 'BUY', t, r.meta?.[t] || '']));
-      r.sells.forEach(t => rows.push([r.month, 'SELL', t, r.meta?.[t] || '']));
-      r.holds.forEach(t => rows.push([r.month, 'KEEP', t, r.meta?.[t] || '']));
+      r.buys.forEach(t => rows.push([r.month, 'BUY', t, r.meta?.[t] || '', fwd(r, t)]));
+      r.sells.forEach(t => rows.push([r.month, 'SELL', t, r.meta?.[t] || '', '']));
+      r.holds.forEach(t => rows.push([r.month, 'KEEP', t, r.meta?.[t] || '', fwd(r, t)]));
     });
     const csv = rows.map(r => r.map(q).join(',')).join('\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -924,25 +1008,7 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             Previous rebalances
           </div>
           {history.map(r => (
-            <div key={r.month} style={{
-              display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap',
-              padding: '7px 0', borderTop: `1px solid ${theme.border}`,
-            }}>
-              <span style={{ fontSize: 11, fontWeight: 600, width: 56, flexShrink: 0,
-                              fontFamily: 'JetBrains Mono, monospace' }}>
-                {r.month}
-              </span>
-              <div style={{ ...chipWrap, flex: 1, minWidth: 220 }}>
-                {r.buys.map(t => <RebalanceChip key={`b-${t}`} ticker={t} kind="buy"
-                  group={r.meta?.[t]} theme={theme} showGroup={false} />)}
-                {r.sells.map(t => <RebalanceChip key={`s-${t}`} ticker={t} kind="sell"
-                  group={r.meta?.[t]} theme={theme} showGroup={false} />)}
-              </div>
-              <span style={{ fontSize: 10.5, color: theme.muted, flexShrink: 0,
-                              fontFamily: 'JetBrains Mono, monospace' }}>
-                {r.holds.length} kept
-              </span>
-            </div>
+            <RebalanceHistoryRow key={r.month} r={r} theme={theme} />
           ))}
         </div>
       )}

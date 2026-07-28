@@ -273,6 +273,40 @@ def test_rebalance_schedule_exposes_picks():
         assert set(row["picks"]) == set(row["buys"]) | set(row["holds"])
 
 
+def test_recent_picks_attribution_sums_to_cohort_mean():
+    prices = _daily_prices([f"T{i}" for i in range(6)], seed=4)
+    monthly = datalib.to_monthly_returns(prices)
+    cohorts = analysis.recent_picks(monthly, top_n=3, rank_lookback=1)
+    assert cohorts
+    labels = [d.strftime("%Y-%m") for d in monthly.index]
+    for c in cohorts:
+        vals = [v for v in c["pick_returns"].values() if v is not None]
+        assert set(c["pick_returns"]) == set(c["picks"])
+        assert abs(np.mean(vals) - c["return_pct"]) < 1e-12
+        # Each value is the pick's actual return in the following month.
+        i = labels.index(c["month"])
+        for t, v in c["pick_returns"].items():
+            expected = monthly.iloc[i + 1][t]
+            if v is None:
+                assert pd.isna(expected)
+            else:
+                assert abs(v - expected) < 1e-12
+
+
+def test_rebalance_schedule_attribution_on_completed_rows_only():
+    prices = _daily_prices([f"T{i}" for i in range(5)], seed=2)
+    monthly = datalib.to_monthly_returns(prices)
+    rows = analysis.rebalance_schedule(monthly, top_n=2, rank_lookback=1, n_months=6)
+    assert rows
+    newest = rows[0]  # newest month-end: nothing realized yet
+    assert "return_pct" not in newest and "pick_returns" not in newest
+    realized = [r for r in rows[1:] if "return_pct" in r]
+    assert realized, "expected at least one realized rebalance row"
+    for r in realized:
+        vals = [v for v in r["pick_returns"].values() if v is not None]
+        assert abs(np.mean(vals) - r["return_pct"]) < 1e-12
+
+
 def test_live_rebalance_prepends_live_row_diffed_vs_last_completed_month():
     prices = _daily_prices([f"T{i}" for i in range(6)], seed=3)
     monthly = datalib.to_monthly_returns(prices)

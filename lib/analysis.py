@@ -205,8 +205,10 @@ def recent_picks(
 ) -> list[dict]:
     """Last `n_cohorts` cohorts that have a realized 1-month forward return.
 
-    Each entry: {month: 'YYYY-MM', picks: [tickers], return_pct: float}.
-    Newest cohort first.
+    Each entry: {month: 'YYYY-MM', picks: [tickers], return_pct: float,
+    pick_returns: {ticker: float | None}}. ``pick_returns`` is the per-ticker
+    forward return the cohort mean averages over (None where the ticker has no
+    bar that month). Newest cohort first.
     """
     ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
@@ -219,13 +221,16 @@ def recent_picks(
         if len(ranking) < top_n:
             continue
         picks = ranking.nlargest(top_n).index.tolist()
-        next_returns = monthly_returns.iloc[i + 1][picks].dropna()
+        forward = monthly_returns.iloc[i + 1][picks]
+        next_returns = forward.dropna()
         if next_returns.empty:
             continue
         out.append({
             "month": monthly_returns.index[i].strftime("%Y-%m"),
             "picks": picks,
             "return_pct": float(next_returns.mean()),
+            "pick_returns": {t: (None if pd.isna(forward[t]) else float(forward[t]))
+                             for t in picks},
         })
     return out
 
@@ -244,6 +249,9 @@ def rebalance_schedule(
     without a realized forward return yet — because that row IS the
     actionable trade list. Each entry, newest first:
     {month: 'YYYY-MM', buys: [...], sells: [...], holds: [...]}.
+    Rows with a following month also carry ``return_pct`` and ``pick_returns``
+    ({ticker: float | None}) — the realized forward return of that month's
+    picks (month-to-date when the following month is still in progress).
     """
     ranking_signal = momentum_signal(monthly_returns, rank_lookback, skip_months)
 
@@ -266,13 +274,22 @@ def rebalance_schedule(
             continue
         prev_set = set(prev)
         curr_set = set(curr)
-        out.append({
+        row = {
             "month": monthly_returns.index[i].strftime("%Y-%m"),
             "picks": curr,
             "buys": [t for t in curr if t not in prev_set],
             "sells": [t for t in prev if t not in curr_set],
             "holds": [t for t in curr if t in prev_set],
-        })
+        }
+        if i + 1 < len(monthly_returns):
+            forward = monthly_returns.iloc[i + 1][curr]
+            realized = forward.dropna()
+            if len(realized):
+                row["return_pct"] = float(realized.mean())
+                row["pick_returns"] = {
+                    t: (None if pd.isna(forward[t]) else float(forward[t])) for t in curr
+                }
+        out.append(row)
     return out
 
 

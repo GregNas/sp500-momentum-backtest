@@ -675,23 +675,43 @@ function V2Dashboard({ params, setParam, data, status, running, error, elapsed,
                       </span>
                     </div>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
-                      {(c.picks_meta || c.picks.map(t => ({ ticker: t, group: '' }))).map(p => (
-                        <span key={p.ticker} style={{
-                          padding: '2px 6px', fontSize: 10.5,
-                          fontFamily: 'JetBrains Mono, monospace',
-                          background: v2Theme.bg, border: `1px solid ${v2Theme.border}`,
-                          borderRadius: 3, color: v2Theme.text,
-                          display: 'inline-flex', gap: 4, alignItems: 'baseline',
-                        }}>
-                          <span style={{ fontWeight: 600 }}>{p.ticker}</span>
-                          {params.universe !== 'sp500' && p.group && (
-                            <span style={{ color: v2Theme.muted, fontFamily: 'inherit',
-                                            fontWeight: 400, fontSize: 10 }}>
-                              {p.group}
+                      {(() => {
+                        const metas = c.picks_meta || c.picks.map(t => ({ ticker: t, group: '' }));
+                        const pr = c.pick_returns || {};
+                        const entries = metas
+                          .map(p => ({ ...p, ret: pr[p.ticker] != null ? pr[p.ticker] : null }))
+                          .sort((a, b) => ((b.ret ?? -Infinity) - (a.ret ?? -Infinity)));
+                        const worst = entries.reduce(
+                          (w, e) => (e.ret != null && (w == null || e.ret < w.ret) ? e : w), null);
+                        return entries.map(p => {
+                          const isWorst = worst && p.ticker === worst.ticker
+                            && p.ret != null && p.ret < 0;
+                          return (
+                            <span key={p.ticker} style={{
+                              padding: '2px 6px', fontSize: 10.5,
+                              fontFamily: 'JetBrains Mono, monospace',
+                              background: isWorst ? '#fef2f2' : v2Theme.bg,
+                              border: `1px solid ${isWorst ? '#fecaca' : v2Theme.border}`,
+                              borderRadius: 3, color: v2Theme.text,
+                              display: 'inline-flex', gap: 4, alignItems: 'baseline',
+                            }}>
+                              <span style={{ fontWeight: 600 }}>{p.ticker}</span>
+                              {p.ret != null && (
+                                <span style={{ fontWeight: 600, fontSize: 10,
+                                                color: p.ret >= 0 ? '#047857' : '#b91c1c' }}>
+                                  {fmtPct(p.ret, 1)}
+                                </span>
+                              )}
+                              {params.universe !== 'sp500' && p.group && (
+                                <span style={{ color: v2Theme.muted, fontFamily: 'inherit',
+                                                fontWeight: 400, fontSize: 10 }}>
+                                  {p.group}
+                                </span>
+                              )}
                             </span>
-                          )}
-                        </span>
-                      ))}
+                          );
+                        });
+                      })()}
                     </div>
                   </div>
                 ))}
