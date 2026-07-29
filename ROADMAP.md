@@ -298,3 +298,34 @@ Carried forward from the 2026-07-28 ideation, deliberately dropped:
 4. **Serialization discipline.** Starlette dumps with `allow_nan=False`, so a NaN or inf anywhere in a response is a 500. `_safe_floats` is not the fix: 0.0 in an equity curve is a wipeout that never happened. Use None for scalars, in-segment forward fill for curves, and assert `json.dumps(payload, allow_nan=False)` in the test.
 5. **No broker connectivity and no trade execution, ever.** The tool emits analysis, numbers and trade lists. Share counts and clipboard exports are the furthest it goes, and the not-advice disclaimer sits above the trade list, not below it.
 6. **Frontend housekeeping.** Bump the `?v=` query on all 4 asset tags in `web/index.html` (currently `?v=4`; several specs claim `?v=5`, so whichever lands second takes the next free number). PERF `strategy` labels stay `top{N}_hold{h}m`: both dashboards match an anchored `/^top\d+_hold(\d+m)$/`, and a suffix silently blanks the drawdown chart and monthly heatmap.
+
+---
+
+## Progress
+
+**Batch 1 shipped 2026-07-28** (commits `9792f9b`, `a8bea20`, `4d1e92d`), plus 2 features the
+owner asked for outside the roadmap:
+
+- [Turnover and transaction-cost drag](docs/superpowers/specs/2026-07-28-turnover-transaction-costs.md).
+  `costBps` defaults to 10 per side, net is the headline series, `costBps=0` reproduces the old
+  numbers. Measured: turnover 1099%/yr at hold1 against 218% at hold6, drag 2.98%/yr against 0.61%.
+  hold6 keeps the best Sharpe both gross and net; the total-return ordering does invert.
+- [Out-of-sample paper-trading ledger](docs/superpowers/specs/2026-07-28-oos-paper-trading-ledger.md).
+  Recorded targets persist to gitignored `userdata/`, marked to market from the price cache.
+- **Version badge**, bottom right, format `1.1.YYMMDDHH` from the last commit date, with mtime and
+  unknown fallbacks.
+- **What's new** modal, fed by git log since 2026-07-27.
+
+A 3-dimension adversarial review of that diff confirmed 13 defects, all fixed in `4d1e92d`. The two
+worth remembering, because both are shapes that will recur:
+
+1. The benchmark column in `prices.parquet` lags the constituent columns (SPY's last bar is NaN
+   while the rest carry the newest one). Any code reading a benchmark at an exact bar silently
+   loses the comparison. Resolve to the last valid bar at or before the target, and disclose which
+   bar was used.
+2. Chaining two series while filtering each independently produces totals over different periods
+   whose difference is not an excess return. Chain both legs over the same set and publish the
+   coverage counts.
+
+Test count went 45 to 112. **Next: batch 2** (regime filter and crash banner, then earnings flags).
+Its open questions are numbers 11 to 17 above.
