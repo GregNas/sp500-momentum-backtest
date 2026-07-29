@@ -106,11 +106,24 @@ def _git(args: List[str]) -> Optional[str]:
     A deployed copy may have no .git directory and no git binary at all, so
     every failure mode (missing binary, not a repo, non-zero exit, timeout)
     collapses to None rather than an exception.
+
+    ``git -C DIR`` searches *upward* for a repository, so this first requires
+    ROOT_DIR to be the repo root itself. Without that check, a copy unpacked
+    inside some unrelated working tree would report that repo's commit date as
+    this app's version and render its commit messages as this app's change feed.
+    ``.git`` is tested as a path rather than a directory so worktrees and
+    submodules, where it is a file, still work.
     """
+    if not (ROOT_DIR / ".git").exists():
+        return None
     try:
         proc = subprocess.run(
             ["git", "-C", str(ROOT_DIR)] + list(args),
-            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False,
+            capture_output=True, timeout=GIT_TIMEOUT_S, check=False,
+            # Decode explicitly: bare text=True uses the host's preferred
+            # encoding, so on a non-UTF-8 locale one accented name in an author
+            # trailer would drop the whole feed instead of one character.
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return None
@@ -678,11 +691,6 @@ _UNIVERSE_SOURCE_WARNING = {
         "Universe list came from the stale on-disk cache (the membership scrape "
         "failed), so it may be weeks out of date."
     ),
-    "price_cache_columns": (
-        "Universe list was reconstructed from the price cache's own columns (no "
-        "scrape and no cached membership file), so it is whatever was last "
-        "downloaded rather than today's index."
-    ),
 }
 
 
@@ -697,16 +705,15 @@ def _assert_json_clean(payload: dict, what: str) -> dict:
     return payload
 
 
-def _record_universe(key: str, benchmark: str, cached_columns) -> Tuple[List[str], str]:
+def _record_universe(key: str, benchmark: str) -> Tuple[List[str], str]:
     """(tickers, source) for the record path, without letting a scrape outage win.
 
     ``get_sp500_tickers`` returns the disk cache only inside its 24h TTL and
     scrapes Wikipedia after that, so on an airgapped box the first Record click a
     day after the last successful scrape would 502 with a perfectly usable price
-    cache sitting right there. Each fallback is recorded on the entry, because a
-    3-month-stale membership list is a real (if small) drift in what was ranked.
-    ``cached_columns`` is a callable so the full-parquet read only happens on that
-    last-resort path.
+    cache sitting right there. The stale-cache fallback is recorded on the entry,
+    because a 3-month-stale membership list is a real (if small) drift in what
+    was ranked.
     """
     if key != "sp500":
         try:
@@ -722,13 +729,17 @@ def _record_universe(key: str, benchmark: str, cached_columns) -> Tuple[List[str
     stale = cache.load_tickers(stale_ok=True)
     if stale:
         return stale, "stale_cache"
-    columns = [c for c in (cached_columns() or []) if c != benchmark]
-    if columns:
-        return columns, "price_cache_columns"
+    # There is deliberately no fall back to the price cache's own columns.
+    # cache/prices.parquet is ONE shared table holding every universe and every
+    # benchmark ever fetched, so handing its column list back as "sp500" would
+    # rank global and sector ETFs alongside S&P names and break the guarantee
+    # that a recorded target equals the leaderboard (I1). Refusing is the honest
+    # outcome: a wrong universe silently recorded is worse than a clear failure.
     raise HTTPException(
         status_code=502,
         detail=("Universe unavailable: the membership scrape failed and there is no "
-                "cached ticker list or price cache to fall back on."),
+                "cached ticker list to fall back on. Run a backtest first to "
+                "populate the membership cache, then record."),
     )
 
 
@@ -767,12 +778,8 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
 
     warnings: list[str] = []
 
-    def cached_columns() -> List[str]:
-        frame = cache.load_prices()
-        return list(frame.columns) if frame is not None else []
-
     universe_tickers, universe_source = _record_universe(
-        params.universe, params.benchmark, cached_columns)
+        params.universe, params.benchmark)
     if universe_source in _UNIVERSE_SOURCE_WARNING:
         warnings.append(_UNIVERSE_SOURCE_WARNING[universe_source])
         on_status(_UNIVERSE_SOURCE_WARNING[universe_source])
@@ -789,7 +796,11 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
             ),
         )
 
-    wanted = universe_tickers + [params.benchmark]
+    # Dedupe: a benchmark that is itself a universe member (SPY under a custom or
+    # ETF universe) would otherwise appear twice, and a duplicated label makes
+    # frame[col] return a DataFrame instead of a Series, which raises deep inside
+    # the ranking rather than here.
+    wanted = list(dict.fromkeys(universe_tickers + [params.benchmark]))
     frame = cache.load_prices(wanted)
     price_source = "cache"
     stale = True
@@ -963,6 +974,21 @@ def ledger_history(
         return {"entries_total": 0, "groups": [], "price_source": "cache",
                 "cache_coverage": cache.coverage(), "warnings": []}
 
+    # ledger.json is a plain file a user may hand-edit, and every downstream date
+    # comparison parses as_of. Skip unusable rows at READ time rather than in
+    # ledger.load(), so one malformed row cannot take down the whole panel and is
+    # also not silently erased the next time append() rewrites the file.
+    unusable = 0
+    usable: list[dict] = []
+    for e in entries:
+        try:
+            pd.Timestamp(e.get("as_of"))
+        except Exception:
+            unusable += 1
+            continue
+        usable.append(e)
+    entries = usable
+
     grouped: dict[str, list[dict]] = {}
     for e in entries:
         grouped.setdefault(e.get("params_hash") or "unknown", []).append(e)
@@ -977,6 +1003,12 @@ def ledger_history(
                     wanted.append(t)
 
     warnings: list[str] = []
+    if unusable:
+        warnings.append(
+            f"{unusable} ledger entr(y/ies) have an unreadable as_of date and were "
+            f"skipped. The file was left untouched: fix or remove those rows in "
+            f"userdata/ledger.json."
+        )
     prices = cache.load_prices(wanted)
     price_source = "cache"
     if refresh and wanted:

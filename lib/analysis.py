@@ -898,12 +898,26 @@ def _mark_segment(entry: dict, s_ts, end_ts, frame: pd.DataFrame,
     # counted as 0.
     return_pct = _jsonf(np.mean(priced)) if priced else None
 
+    # Both benchmark endpoints resolve to the last valid bar at or before the
+    # target date, the same rule the constituent legs above and the record
+    # endpoint already use. Reading the exact bar instead would drop the
+    # comparison entirely whenever the benchmark column lags the constituents,
+    # which is the normal cache state (one late column among hundreds), and it
+    # is the open segment — the one the user watches — that always ends on the
+    # frame's last bar. The bars actually used are reported so a short benchmark
+    # window is disclosed rather than passed off as aligned.
     bench_return = None
-    if (bench is not None and s_ts is not None and end_ts is not None
-            and s_ts in bench.index and end_ts in bench.index):
-        b0, b1 = _jsonf(bench.loc[s_ts]), _jsonf(bench.loc[end_ts])
-        if b0 is not None and b1 is not None and b0 > 0:
-            bench_return = _jsonf(b1 / b0 - 1)
+    bench_from_date = None
+    bench_to_date = None
+    if bench is not None and s_ts is not None and end_ts is not None:
+        b_start = bench.loc[:s_ts].dropna()
+        b_end = bench.loc[:end_ts].dropna()
+        if len(b_start) and len(b_end):
+            b0, b1 = _jsonf(b_start.iloc[-1]), _jsonf(b_end.iloc[-1])
+            if b0 is not None and b1 is not None and b0 > 0:
+                bench_return = _jsonf(b1 / b0 - 1)
+                bench_from_date = b_start.index[-1].strftime("%Y-%m-%d")
+                bench_to_date = b_end.index[-1].strftime("%Y-%m-%d")
 
     excess = (None if return_pct is None or bench_return is None
               else _jsonf(return_pct - bench_return))
@@ -923,6 +937,10 @@ def _mark_segment(entry: dict, s_ts, end_ts, frame: pd.DataFrame,
         "pick_returns": pick_returns,
         "return_pct": return_pct,
         "bench_return_pct": bench_return,
+        # The bars the benchmark legs came from. They differ from start_date /
+        # end_date when the benchmark column lags, which the UI discloses.
+        "bench_from_date": bench_from_date,
+        "bench_to_date": bench_to_date,
         # Difference of the two returns in the same fractional units; the UI
         # renders it as percentage points.
         "excess_pp": excess,
@@ -1055,8 +1073,8 @@ def ledger_marks(
             if all(v is not None for v in scaled):
                 bench_vals = scaled
 
-    def chain(key: str) -> float | None:
-        legs = [r[key] for r in rows if r[key] is not None]
+    def chain(key: str, over: list[dict]) -> float | None:
+        legs = [r[key] for r in over if r[key] is not None]
         if not legs:
             return None
         acc = 1.0
@@ -1064,8 +1082,17 @@ def ledger_marks(
             acc *= (1.0 + r)
         return _jsonf(acc - 1.0)
 
-    total = chain("return_pct")
-    bench_total = chain("bench_return_pct")
+    # The two headline totals must compound over the SAME segments, or their
+    # difference is not an excess return: it would subtract a benchmark measured
+    # over a shorter period from a strategy measured over a longer one. Segments
+    # missing either leg are excluded from both, and the counts are published so
+    # a spliced chain can never be presented as a full-period total.
+    total_all = chain("return_pct", rows)
+    comparable = [r for r in rows
+                  if r["return_pct"] is not None and r["bench_return_pct"] is not None]
+    total = chain("return_pct", comparable)
+    bench_total = chain("bench_return_pct", comparable)
+    n_priced_segments = sum(1 for r in rows if r["return_pct"] is not None)
     n_completed = sum(1 for r in rows if not r["is_open"] and r["return_pct"] is not None)
     first_as_of = ordered[0]["as_of"]
     days_live = 0
@@ -1108,8 +1135,16 @@ def ledger_marks(
             "n_segments": m,
             "n_completed": n_completed,
             "days_live": days_live,
+            # total_return and benchmark_total_return chain the same segments, so
+            # excess is a real difference. total_return_all_segments compounds
+            # every priced segment including those the benchmark could not mark,
+            # and equals total_return whenever the comparison is complete.
             "total_return": total,
             "benchmark_total_return": bench_total,
+            "total_return_all_segments": total_all,
+            "n_comparable_segments": len(comparable),
+            "n_priced_segments": n_priced_segments,
+            "comparison_covers_all_segments": len(comparable) == n_priced_segments,
             "excess": (None if total is None or bench_total is None
                        else _jsonf(total - bench_total)),
             "equity_starts_at": (dates[0].strftime("%Y-%m-%d") if dates else None),

@@ -676,7 +676,10 @@ function V1Dashboard({ params, ranParams, setParam, data, status, running, error
               <span style={{ fontWeight: 600 }}>Read before trusting these numbers.</span>{' '}
               Survivorship bias — uses the <em>current</em> S&P 500 list, so failed names from earlier years are absent. Effect grows with longer lookbacks.
               Look-ahead is clean (ranking on month-end, forward returns start next month).
-              Ignores costs, taxes, slippage. Equal-weight, no risk constraints.
+              {data.COST_BPS > 0
+                ? `Trading cost of ${data.COST_BPS} bps per side is charged on turnover; taxes and slippage are not.`
+                : 'Ignores costs, taxes, slippage.'}
+              {' '}Equal-weight, no risk constraints.
             </div>
           </div>
           </>

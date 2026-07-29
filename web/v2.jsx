@@ -890,20 +890,28 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                 Names that fell out are silently absent — making the strategy look better the
                 further back the window goes.{' '}
                 <strong>Look-ahead is clean</strong> (rank on month-end close, hold starts next month).{' '}
-                <strong>No costs modelled</strong> — no transaction fees, slippage, or taxes.
-                Equal-weight, no risk constraints. Treat results as upper-bound, not what you'd actually clear.
+                {data.COST_BPS > 0
+                  ? <><strong>Trading cost of {data.COST_BPS} bps per side</strong> is charged on turnover; slippage and taxes are not.</>
+                  : <><strong>No costs modelled</strong> — no transaction fees, slippage, or taxes.</>}
+                {' '}Equal-weight, no risk constraints. Treat results as an upper bound, not what you'd actually clear.
               </>)}
               {params.universe === 'global_etfs' && (<>
                 <strong>USD-denominated, US-listed ETFs only</strong> — embedded FX exposure varies by fund.
                 <strong> Tracking error and expense-ratio drag</strong> (~0.50 %/yr typical for single-country iShares)
                 are not modelled. Universe ranges from ~11 (pre-2010) to ~35 names — small-N momentum is noisier.{' '}
-                <strong>Look-ahead is clean</strong>; <strong>no transaction costs</strong>; equal-weight.
+                <strong>Look-ahead is clean</strong>;{' '}
+                {data.COST_BPS > 0
+                  ? <><strong>{data.COST_BPS} bps/side trading cost charged</strong> (expense-ratio drag is not)</>
+                  : <strong>no transaction costs</strong>}; equal-weight.
               </>)}
               {params.universe === 'us_sector_etfs' && (<>
                 <strong>11-member universe</strong> (10 before XLRE inception 2015-10, 9 before XLC inception 2018-06).
                 <strong> Sectors are highly correlated</strong> by construction — a top-3 cohort is closer to a tilt
                 than a diversified portfolio. Expense ratio (~0.10 %) and tracking error not modelled.{' '}
-                <strong>Look-ahead is clean</strong>; <strong>no transaction costs</strong>; equal-weight.
+                <strong>Look-ahead is clean</strong>;{' '}
+                {data.COST_BPS > 0
+                  ? <><strong>{data.COST_BPS} bps/side trading cost charged</strong></>
+                  : <strong>no transaction costs</strong>}; equal-weight.
               </>)}
             </div>
           </div>

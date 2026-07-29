@@ -365,6 +365,56 @@ def test_marks_dividend_scale_drift_does_not_trip_the_basis_chip():
     assert out["rows"][0]["basis_shifted"] is False
 
 
+def test_marks_survive_a_lagging_benchmark_column():
+    # The live cache is exactly this shape: the benchmark's last bars are NaN
+    # while the constituents carry the newest one. Reading the exact bar would
+    # drop the comparison on every segment ending at the frame's last bar, which
+    # includes the open segment the user actually watches.
+    frame = _ramp_frame({"A": 0.004, "B": 0.002, "BENCH": 0.0015})
+    s0, s1 = frame.index[-61], frame.index[-31]
+    picks = ["A", "B"]
+    lagged = frame.copy()
+    lagged.loc[lagged.index[-2:], "BENCH"] = np.nan
+    out = analysis.ledger_marks(
+        [_entry(s0, picks, frame), _entry(s1, picks, frame)], lagged, benchmark="BENCH")
+
+    open_row = out["rows"][0]
+    assert open_row["bench_return_pct"] is not None
+    assert open_row["excess_pp"] is not None
+    # It reports the bar it actually used, which is earlier than the row's end.
+    last_valid = lagged["BENCH"].dropna().index[-1].strftime("%Y-%m-%d")
+    assert open_row["bench_to_date"] == last_valid
+    assert open_row["bench_to_date"] != open_row["end_date"]
+    # Both headline legs chain the same segments, so excess is a real difference.
+    s = out["summary"]
+    assert s["n_comparable_segments"] == s["n_priced_segments"]
+    assert s["comparison_covers_all_segments"] is True
+    json.dumps(out, allow_nan=False)
+
+
+def test_marks_chain_both_legs_over_the_same_segments():
+    # A benchmark that only starts partway through: the older segment cannot be
+    # compared, so it must be excluded from BOTH totals rather than counted in
+    # the strategy leg alone, which would make excess subtract mismatched periods.
+    frame = _ramp_frame({"A": 0.004, "B": 0.002, "BENCH": 0.0015})
+    s0, s1 = frame.index[-61], frame.index[-31]
+    picks = ["A", "B"]
+    partial = frame.copy()
+    partial.loc[partial.index[:-31], "BENCH"] = np.nan   # no bars before s1
+    out = analysis.ledger_marks(
+        [_entry(s0, picks, frame), _entry(s1, picks, frame)], partial, benchmark="BENCH")
+
+    s = out["summary"]
+    assert s["n_priced_segments"] == 2
+    assert s["n_comparable_segments"] == 1
+    assert s["comparison_covers_all_segments"] is False
+    # total_return covers only the comparable segment; the all-segment figure is
+    # published separately and differs.
+    assert s["total_return"] != s["total_return_all_segments"]
+    assert abs(s["excess"] - (s["total_return"] - s["benchmark_total_return"])) < 1e-12
+    json.dumps(out, allow_nan=False)
+
+
 def test_marks_benchmark_is_aligned_bar_for_bar():
     frame = _ramp_frame({"A": 0.004, "B": 0.002, "BENCH": 0.0015})
     s0, s1, t1 = frame.index[-61], frame.index[-31], frame.index[-1]
@@ -572,7 +622,12 @@ def test_record_falls_back_to_the_stale_ticker_cache_offline(tmp_path, monkeypat
     assert out["warnings"]
 
 
-def test_record_falls_back_to_price_cache_columns(tmp_path, monkeypatch):
+def test_record_refuses_rather_than_using_price_cache_columns(tmp_path, monkeypatch):
+    # prices.parquet is one shared table holding every universe and benchmark
+    # ever fetched, so its column list is not an sp500 membership list. Recording
+    # off it would rank foreign tickers and break the guarantee that a recorded
+    # target equals the leaderboard, so with no membership available at all the
+    # only honest outcome is to refuse.
     _record_setup(tmp_path, monkeypatch)
 
     def no_network():
@@ -580,10 +635,31 @@ def test_record_falls_back_to_price_cache_columns(tmp_path, monkeypatch):
 
     monkeypatch.setattr(data, "get_sp500_tickers", no_network)
     assert not cache.TICKERS_JSON.exists()
+    with pytest.raises(server.HTTPException) as exc:
+        server._record_ledger_target(server.LedgerRecordParams(
+            universe="sp500", topN=3, rankLookback=1, benchmark="BENCH"))
+    assert exc.value.status_code == 502
+    assert "cached ticker list" in exc.value.detail
+    # Nothing was written on the refusal path.
+    assert ledger.load() == []
+
+
+def test_record_still_works_from_a_stale_membership_cache(tmp_path, monkeypatch):
+    # The airgap path that IS legitimate: a real membership list on disk, merely
+    # past its TTL. It records, and says so on the entry.
+    _record_setup(tmp_path, monkeypatch)
+
+    def no_network():
+        raise RuntimeError("airgapped")
+
+    monkeypatch.setattr(data, "get_sp500_tickers", no_network)
+    cache.save_tickers(list(_UNIVERSE))
     out = server._record_ledger_target(server.LedgerRecordParams(
         universe="sp500", topN=3, rankLookback=1, benchmark="BENCH"))
-    assert out["entry"]["universe_source"] == "price_cache_columns"
+    assert out["entry"]["universe_source"] == "stale_cache"
+    # Still narrowed: the benchmark and the foreign ticker must not be ranked.
     assert "BENCH" not in out["entry"]["tickers"]
+    assert "XLK" not in out["entry"]["tickers"]
 
 
 def test_record_flags_a_stale_browser_tab(tmp_path, monkeypatch):

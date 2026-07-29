@@ -62,6 +62,19 @@ function EquityCurveChart({
     return [0, 1, 2, 3, 4].map(i => min + step * i);
   }, [logScale, min, max]);
 
+  // fmtEquityAxis rounds to whole percent, which is right for a multi-hundred-
+  // percent backtest curve but collapses several ticks to the same label on a
+  // narrow range (a young ledger curve spanning a couple of percent would print
+  // "+1%" three times). Add decimals only when the span is small, so every
+  // existing chart keeps its current labels.
+  const yLabel = (t) => {
+    const span = max - min;
+    if (logScale || span >= 0.05) return fmtEquityAxis(t);
+    const digits = span >= 0.005 ? 1 : 2;
+    const pct = (t - 1) * 100;
+    return `${pct > 0 ? '+' : ''}${pct.toFixed(digits)}%`;
+  };
+
   // X ticks: year boundaries
   const xTicks = useMemo(() => {
     const out = [];
@@ -99,7 +112,7 @@ function EquityCurveChart({
                 stroke={theme.grid} strokeWidth="1" strokeDasharray="2 4" />
           <text x={padL - 8} y={yAt(t) + 4} textAnchor="end"
                 fontSize="11" fill={theme.axis} fontFamily="JetBrains Mono, monospace">
-            {fmtEquityAxis(t)}
+            {yLabel(t)}
           </text>
         </g>
       ))}
@@ -1532,11 +1545,21 @@ function LedgerRow({ r, theme, isNewest }) {
                           : (r.return_pct >= 0 ? '#047857' : '#b91c1c') }}>
           {r.return_pct == null ? '—' : fmtPct(r.return_pct, 1)}
         </span>
-        <span title={`${r.benchmark || 'benchmark'} over the same dates`}
-              style={{ fontSize: 10.5, width: 62, textAlign: 'right', flexShrink: 0,
-                        fontFamily: 'JetBrains Mono, monospace', color: theme.muted }}>
-          {r.bench_return_pct == null ? '—' : fmtPct(r.bench_return_pct, 1)}
-        </span>
+        {(() => {
+          // The benchmark column can lag the constituents, so say which bars the
+          // comparison actually used rather than implying it lined up.
+          const lagged = r.bench_to_date && r.bench_to_date !== r.end_date;
+          return (
+            <span title={lagged
+                    ? `${r.benchmark || 'benchmark'} ${r.bench_from_date} to ${r.bench_to_date}: its last bar predates this row's ${r.end_date}`
+                    : `${r.benchmark || 'benchmark'} over the same dates`}
+                  style={{ fontSize: 10.5, width: 62, textAlign: 'right', flexShrink: 0,
+                            fontFamily: 'JetBrains Mono, monospace', color: theme.muted }}>
+              {r.bench_return_pct == null ? '—' : fmtPct(r.bench_return_pct, 1)}
+              {lagged && <span style={{ color: '#b45309' }} aria-label="benchmark bars lag">*</span>}
+            </span>
+          );
+        })()}
         <span title="Excess over the benchmark, in percentage points"
               style={{ fontSize: 10.5, fontWeight: 600, width: 62, textAlign: 'right',
                         flexShrink: 0, fontFamily: 'JetBrains Mono, monospace',
@@ -1594,13 +1617,29 @@ function LedgerRow({ r, theme, isNewest }) {
 // cannot drift apart. `ranParams` must be the params of the last *executed* run,
 // not the live sidebar values, or Record would file a cohort under settings the
 // user only typed.
+
+// The settings that define a ledger group. Must stay in step with the fields
+// server.py hashes into params_hash, or the recorded hint would follow a group
+// it does not belong to.
+function recordKey(p) {
+  if (!p) return null;
+  return [p.universe || 'sp500', p.topN, p.rankLookback,
+          p.skipMonths || 0, p.benchmark || 'SPY'].join('|');
+}
+
 function useLedgerRecorder(ranParams, rebalance) {
   const [recordState, setRecordState] = useState('idle');
   const [recordMessage, setRecordMessage] = useState(null);
   const [ledgerVersion, setLedgerVersion] = useState(0);
-  const [recordedAsOf, setRecordedAsOf] = useState(null);
+  // Tagged with the settings it was recorded under, not just the date: the
+  // "ledger holds X" hint must not survive a re-run under a different universe
+  // or topN, where it would claim a cohort that group never recorded.
+  const [recorded, setRecorded] = useState(null);
+  const setRecordedAsOf = (asOf) => setRecorded({ asOf, key: recordKey(ranParams) });
 
   const latest = rebalance && rebalance.length ? rebalance[0] : null;
+  const recordedAsOf = (recorded && recorded.key === recordKey(ranParams))
+    ? recorded.asOf : null;
 
   // A new run invalidates the previous outcome message.
   useEffect(() => { setRecordState('idle'); setRecordMessage(null); }, [rebalance]);
@@ -1803,10 +1842,14 @@ function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
                     : (s.total_return >= 0 ? '#047857' : '#b91c1c'))}
             {tile(group.benchmark || 'Benchmark',
                   s.benchmark_total_return == null ? '—' : fmtPct(s.benchmark_total_return, 1),
-                  'same dates, bar for bar')}
+                  s.comparison_covers_all_segments === false
+                    ? `${s.n_comparable_segments} of ${s.n_priced_segments} segments comparable`
+                    : 'same dates, bar for bar')}
             {tile('Excess',
                   s.excess == null ? '—' : `${(s.excess * 100).toFixed(1)}pp`,
-                  'difference of totals',
+                  s.comparison_covers_all_segments === false
+                    ? 'over comparable segments only'
+                    : 'difference of totals',
                   s.excess == null ? theme.muted
                     : (s.excess >= 0 ? '#047857' : '#b91c1c'))}
             {tile('Live since', s.first_as_of || '—',
@@ -2257,7 +2300,27 @@ function BuildInfo({ theme, accent, headingFont }) {
     const focusTimer = setTimeout(() => {
       if (closeRef.current) closeRef.current.focus();
     }, 0);
-    const onKeyDown = e => { if (e.key === 'Escape') setOpen(false); };
+    // aria-modal claims the rest of the page is unreachable, so Tab has to
+    // actually cycle inside the dialog. Without this, tabbing walks into the
+    // sidebar controls behind the backdrop, which are visually obscured and
+    // cannot be clicked. The focusable set is queried live rather than pinned to
+    // closeRef so this stays correct if the dialog gains more controls.
+    const onKeyDown = e => {
+      if (e.key === 'Escape') { setOpen(false); return; }
+      if (e.key !== 'Tab') return;
+      const dialog = closeRef.current && closeRef.current.closest('[role="dialog"]');
+      if (!dialog) return;
+      const f = dialog.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+      if (!f.length) return;
+      const first = f[0], last = f[f.length - 1];
+      const inside = dialog.contains(document.activeElement);
+      if (e.shiftKey && (!inside || document.activeElement === first)) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && (!inside || document.activeElement === last)) {
+        e.preventDefault(); first.focus();
+      }
+    };
     document.addEventListener('keydown', onKeyDown);
     return () => {
       clearTimeout(focusTimer);
