@@ -49,6 +49,11 @@ class BacktestParams(BaseModel):
     # Trading cost in basis points charged on each side of a trade. Replacing the
     # whole book bills 2x this. costBps=0 reproduces the pre-cost numbers exactly.
     costBps: float = Field(10.0, ge=0.0, le=100.0)
+    # Regime filter. "off" adds no filtered series and no PERF rows, so the
+    # response is unchanged (I2). The REGIME banner payload is computed either
+    # way: it is pure diagnostics over data already in hand.
+    regimeMode: Literal["off", "cash", "benchmark"] = "off"
+    regimeMaDays: int = Field(200, ge=20, le=400)
     runId: Optional[str] = None
 
 
@@ -225,6 +230,23 @@ VERSION = "{}.{}".format(APP_VERSION, _BUILD_STAMP or "unknown")
 WHATS_NEW, WHATS_NEW_SOURCE = _whats_new_entries()
 
 
+def _num(v) -> Optional[float]:
+    """float, or None for anything not finite.
+
+    REGIME is a dict of scalars, so it is not covered by _safe_floats (series
+    only), and Starlette renders with allow_nan=False: one NaN 500s the whole
+    backtest. None is also the honest answer here, since a missing moving average
+    is not a flat one.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if not np.isfinite(f) else f
+
+
 def _safe_floats(series: pd.Series) -> list:
     """Convert a pandas Series to a JSON-safe list (NaN → 0.0)."""
     return [0.0 if pd.isna(v) else float(v) for v in series]
@@ -335,6 +357,17 @@ def _run_backtest(params: BacktestParams) -> dict:
         strategy_returns[h] = d["net"]
         gross_returns[h] = d["gross"]
 
+    # Regime: the mask is a decision made AT each month-end, so apply_regime
+    # shifts it before touching the following month's return. Computed even when
+    # the filter is off, because the banner is pure diagnostics.
+    regime_mask = analysis.regime_mask(benchmark_prices, monthly.index,
+                                       ma_days=params.regimeMaDays)
+    filtered_returns: dict[int, pd.Series] = {}
+    if params.regimeMode != "off":
+        repl = 0.0 if params.regimeMode == "cash" else benchmark_monthly
+        for h, r in strategy_returns.items():
+            filtered_returns[h] = analysis.apply_regime(r, regime_mask, repl)
+
     if not strategy_returns or all(s.empty for s in strategy_returns.values()):
         raise HTTPException(
             status_code=400,
@@ -368,6 +401,11 @@ def _run_backtest(params: BacktestParams) -> dict:
         drawdown[f"h{h}m"] = _drawdown(r)
         monthly_returns_out[f"h{h}m"] = _safe_floats(r)
         turnover_out[f"h{h}m"] = _safe_floats(detail[h]["turnover"])
+    for h, fr in filtered_returns.items():
+        fr = fr.reindex(first_returns.index)
+        equity[f"h{h}m_filt"] = _safe_floats((1 + fr.fillna(0)).cumprod())
+        drawdown[f"h{h}m_filt"] = _drawdown(fr)
+        monthly_returns_out[f"h{h}m_filt"] = _safe_floats(fr)
 
     bench_eq = (1 + bench_aligned).cumprod()
     equity["spy"] = _safe_floats(bench_eq)
@@ -385,6 +423,11 @@ def _run_backtest(params: BacktestParams) -> dict:
         g = analysis.perf_stats(gross_returns[h], risk_free_annual=params.riskFree)
         perf_rows.append({
             "strategy": f"top{params.topN}_hold{h}m",
+            # The label is deliberately NOT suffixed for filtered rows: both
+            # dashboards derive bestKey from an anchored /^top\d+_hold(\d+m)$/,
+            # and a suffix would silently blank the drawdown chart and heatmap.
+            # They distinguish the rows by this flag instead.
+            "filtered": False,
             **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
                for k, v in s.items()},
             # Gross counterparts, so the UI can show what the costs took.
@@ -394,9 +437,18 @@ def _run_backtest(params: BacktestParams) -> dict:
             "gross_max_drawdown": float(g["max_drawdown"]),
             "cost_drag": float(g["CAGR"] - s["CAGR"]),
         })
+    for h, fr in filtered_returns.items():
+        s = analysis.perf_stats(fr, risk_free_annual=params.riskFree)
+        perf_rows.append({
+            "strategy": f"top{params.topN}_hold{h}m",
+            "filtered": True,
+            **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
+               for k, v in s.items()},
+        })
     bench_stats = analysis.perf_stats(bench_aligned, risk_free_annual=params.riskFree)
     perf_rows.append({
         "strategy": params.benchmark,
+        "filtered": False,
         **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
            for k, v in bench_stats.items()},
     })
@@ -430,9 +482,55 @@ def _run_backtest(params: BacktestParams) -> dict:
             r.reindex(first_returns.index), risk_free_annual=params.riskFree
         ).fillna(0)
         rolling_sharpe_out[f"h{h}m"] = _safe_floats(rs)
+    for h, fr in filtered_returns.items():
+        rolling_sharpe_out[f"h{h}m_filt"] = _safe_floats(analysis.rolling_sharpe(
+            fr.reindex(first_returns.index), risk_free_annual=params.riskFree).fillna(0))
     rolling_sharpe_out["spy"] = _safe_floats(
         analysis.rolling_sharpe(bench_aligned, risk_free_annual=params.riskFree).fillna(0)
     )
+
+    # ---- Regime banner payload ----
+    # Picked by the SAME rule both dashboards use for bestStrat (highest Sharpe
+    # among unfiltered non-benchmark rows). If the two ever drift, the banner
+    # would attribute its month-to-date numbers to a sleeve the header is not
+    # showing, so the client-side selectors carry a matching comment.
+    unfiltered = [p for p in perf_rows
+                  if p["strategy"] != params.benchmark and not p["filtered"]]
+    best_row = max(unfiltered, key=lambda p: p["Sharpe"], default=None)
+    best_h = int(best_row["strategy"].rsplit("_hold", 1)[1][:-1]) if best_row else None
+
+    regime = analysis.regime_snapshot(benchmark_prices, ma_days=params.regimeMaDays)
+    regime["mode"] = params.regimeMode
+    regime["vol"] = analysis.realized_vol_percentile(benchmark_prices)
+    decision = regime_mask.shift(1)
+    regime["warmup_months"] = int(regime_mask.isna().sum())
+    regime["coverage_months"] = int(regime_mask.notna().sum())
+    # Month-END labels where the signal read risk-off, i.e. DECISION dates: an
+    # entry of "2022-02" means 2022-02 closed below the average, so 2022-03 is
+    # the month that gets replaced. Named _month_ends because "risk_off_months"
+    # reads like "the months skipped", and that off-by-one is the whole timing
+    # bug this design avoids.
+    regime["risk_off_month_ends"] = [
+        d.strftime("%Y-%m") for d in regime_mask.index[regime_mask.eq(False).fillna(False)]
+    ]
+    regime["mtd"] = None
+    regime["conditional"] = None
+    if best_h is not None:
+        regime["conditional"] = analysis.regime_conditional_stats(
+            strategy_returns[best_h], regime_mask, benchmark_monthly)
+        sleeve = strategy_returns[best_h].dropna()
+        if len(sleeve):
+            label = sleeve.index[-1]
+            regime["mtd"] = {
+                "sleeve": f"h{best_h}m",
+                "strategy": _num(sleeve.iloc[-1]),
+                "benchmark": _num(benchmark_monthly.get(label)),
+                "spread": _num(sleeve.iloc[-1] - benchmark_monthly.get(label, np.nan)),
+                "as_of": constituents.index.max().strftime("%Y-%m-%d"),
+                # True when the newest monthly bar is still in progress, the same
+                # test the cohort rows already use for fwd_partial.
+                "is_partial": bool(constituents.index.max() < label),
+            }
 
     # ---- Cohort group breakdown (sector or country/region per universe) ----
     sector_map = {t: m.get("sector", "") for t, m in universe_meta.items()}
@@ -475,6 +573,8 @@ def _run_backtest(params: BacktestParams) -> dict:
     yearly_returns_out: dict = {}
     for h, r in strategy_returns.items():
         yearly_returns_out[f"h{h}m"] = analysis.calendar_year_returns(r)
+    for h, fr in filtered_returns.items():
+        yearly_returns_out[f"h{h}m_filt"] = analysis.calendar_year_returns(fr)
     yearly_returns_out["spy"] = analysis.calendar_year_returns(bench_aligned)
 
     return {
@@ -488,6 +588,7 @@ def _run_backtest(params: BacktestParams) -> dict:
         "MONTHLY_RETURNS": monthly_returns_out,
         "YEARLY_RETURNS": yearly_returns_out,
         "ROLLING_SHARPE": rolling_sharpe_out,
+        "REGIME": regime,
         "COHORT_GROUPS": cohort_groups,
         "RECENT_COHORTS": cohorts,
         "REBALANCE": rebalance,
@@ -625,6 +726,8 @@ def universe_info() -> dict:
             "rankLookback": {"min": 1, "max": 12},
             "skipMonths": {"min": 0, "max": 2},
             "costBps": {"min": 0, "max": 100},
+            "regimeMaDays": {"min": 20, "max": 400},
+            "regimeMode": {"values": ["off", "cash", "benchmark"]},
             "horizon": {"min": 1, "max": 24},
         },
         "universes": {},

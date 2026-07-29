@@ -1177,3 +1177,197 @@ def calendar_year_returns(returns: pd.Series) -> list[dict]:
             "partial": bool(len(grp) < 12),
         })
     return out
+
+
+# ---------- market regime: 200dma state, filtering, and conditional evidence ----------
+
+REGIME_MA_DAYS = 200
+
+
+def regime_state(benchmark_prices: pd.Series,
+                 ma_days: int = REGIME_MA_DAYS) -> pd.DataFrame:
+    """Daily frame of the benchmark's trend state.
+
+    Columns: ``close``, ``ma`` (trailing ``ma_days``-bar mean), ``dist``
+    (close / ma - 1) and ``above`` (close >= ma). ``ma_days`` counts BARS, not
+    calendar days: the series is daily closes with weekends and holidays absent,
+    so a 200-bar mean is the conventional 200-day average.
+
+    ``above`` is pinned to the nullable ``"boolean"`` dtype and is NA until the
+    average has a full window. The dtype matters: ``(s >= ma).where(ma.notna())``
+    alone yields ``object`` holding NaN, and object and nullable-boolean masks
+    behave *oppositely* under the natural ``.where(decision != False, ...)``
+    idiom, so leaving it implicit would let a later refactor silently flip what
+    the warm-up months do. :func:`apply_regime` is written to be safe either way,
+    but the dtype is fixed here as well.
+    """
+    s = benchmark_prices.dropna()
+    ma = s.rolling(ma_days).mean()
+    above = (s >= ma).astype("boolean").where(ma.notna())
+    return pd.DataFrame({"close": s, "ma": ma, "dist": s / ma - 1, "above": above})
+
+
+def regime_mask(benchmark_prices: pd.Series, monthly_index,
+                ma_days: int = REGIME_MA_DAYS) -> pd.Series:
+    """Risk-on flag AT each month-end label, using only bars at or before it.
+
+    The value at label t is whether the last benchmark bar at or before t closed
+    at or above its moving average. pd.NA while the average has no full window.
+
+    This is a decision made ON t, so applying it to month t's own return would be
+    lookahead; every consumer shifts it by one month. ``method="ffill"`` picks the
+    last bar at or before each label, which also makes the in-progress month
+    correct: its label is a future month-end, so the mask uses the latest bar that
+    actually exists.
+    """
+    st = regime_state(benchmark_prices, ma_days)
+    return st["above"].reindex(monthly_index, method="ffill")
+
+
+def apply_regime(returns: pd.Series, mask: pd.Series,
+                 replacement: float | pd.Series = 0.0) -> pd.Series:
+    """Replace the months the regime said to sit out.
+
+    Month t's exposure is decided by the state at month t-1's close, so the mask
+    is shifted one month. A month is replaced only where the prior month-end was
+    *explicitly* risk-off: NA (the moving-average warm-up) leaves the sleeve
+    invested rather than silently zeroing it.
+
+    Two details here are load-bearing. First, ``decision.eq(False).fillna(False)``
+    builds the "sit out" mask positively, because ``~decision`` propagates NA and
+    ``.where(decision != False, ...)`` disagrees between object and
+    nullable-boolean dtypes. Second, the shift happens on the MONTHLY index and
+    only then is reindexed onto ``returns.index``, which is a strict subset of it
+    (the backtest starts after the ranking warm-up and appends a label only when
+    a sleeve produced a return). Reindexing first would shift inside the subset,
+    which both leaves the first strategy month unfiltered when its predecessor is
+    perfectly well known, and makes any skipped month reach two labels back. The
+    orderings agree on a gapless index, which is why the wrong one ships easily.
+    """
+    decision = mask.shift(1).reindex(returns.index)
+    off = decision.eq(False).fillna(False).astype(bool)
+    repl = (replacement.reindex(returns.index) if isinstance(replacement, pd.Series)
+            else pd.Series(replacement, index=returns.index))
+    return returns.mask(off, repl)
+
+
+def _bucket_stats(vals: pd.Series, bench: pd.Series) -> dict:
+    """Mean/median/t-stat for one regime bucket, with no NaN escaping.
+
+    An empty or single-observation bucket reports ``n`` with None statistics
+    rather than being omitted, so the UI can say "no comparable months" instead
+    of tripping over a missing key.
+    """
+    n = int(len(vals))
+    spread = (vals - bench).dropna()
+    return {
+        "n": n,
+        "mean": _jsonf(vals.mean()) if n else None,
+        "median": _jsonf(vals.median()) if n else None,
+        "bench_mean": _jsonf(bench.mean()) if len(bench.dropna()) else None,
+        "spread_mean": _jsonf(spread.mean()) if len(spread) else None,
+        "t_stat": _jsonf(_newey_west_tstat(vals.values)) if n else None,
+        "t_stat_spread": _jsonf(_newey_west_tstat(spread.values)) if len(spread) else None,
+    }
+
+
+def regime_conditional_stats(strategy_returns: pd.Series, mask: pd.Series,
+                             benchmark_monthly: pd.Series) -> dict:
+    """What happened NEXT, bucketed by the regime state observable beforehand.
+
+    Returns ``{"risk_on"|"risk_off"|"warmup": {...}}``. The buckets come from the
+    same ``mask.shift(1)`` decision series :func:`apply_regime` uses, so the
+    banner's evidence and the filtered curve can never disagree about which
+    months were risk-off. ``spread`` is strategy minus the same-month benchmark,
+    matching the event study's time-aligned convention, and the t-stats are
+    Newey-West because overlapping sleeves are autocorrelated.
+    """
+    r = strategy_returns.dropna()
+    decision = mask.shift(1).reindex(r.index)
+    bench = benchmark_monthly.reindex(r.index)
+    is_on = decision.eq(True).fillna(False).astype(bool)
+    is_off = decision.eq(False).fillna(False).astype(bool)
+    warm = ~(is_on | is_off)
+    return {
+        "risk_on": _bucket_stats(r[is_on], bench[is_on]),
+        "risk_off": _bucket_stats(r[is_off], bench[is_off]),
+        "warmup": _bucket_stats(r[warm], bench[warm]),
+    }
+
+
+def regime_snapshot(benchmark_prices: pd.Series, ma_days: int = REGIME_MA_DAYS,
+                    dd_window_days: int = 365) -> dict:
+    """Live regime state for the banner.
+
+    ``as_of`` and ``close`` are the last *valid* benchmark bar and are always
+    reported, because the banner needs a date even with no state to show. The
+    benchmark column routinely lags the constituents, so this date can trail the
+    trade list's own as_of; both are surfaced rather than reconciled.
+
+    Everything else is None (never 0.0) while the moving average has no full
+    window: a missing 200-day average is not a flat one.
+    """
+    s = benchmark_prices.dropna()
+    if s.empty:
+        return {"as_of": None, "close": None, "ma": None, "dist": None,
+                "above": None, "days_in_state": None, "state_since": None,
+                "drawdown": None, "ma_days": int(ma_days)}
+    st = regime_state(s, ma_days)
+    last = st.index[-1]
+    above = st["above"].iloc[-1]
+    above_out = None if pd.isna(above) else bool(above)
+
+    days_in_state = None
+    state_since = None
+    if above_out is not None:
+        run = st["above"].dropna()
+        same = run == run.iloc[-1]
+        # Walk back while the state is unchanged; the run starts at the first bar
+        # of the current above/below stretch.
+        start = run.index[-1]
+        for ts in reversed(run.index):
+            if not bool(same.loc[ts]):
+                break
+            start = ts
+        state_since = start.strftime("%Y-%m-%d")
+        days_in_state = int((last - start).days)
+
+    window = s.loc[s.index >= last - pd.Timedelta(days=dd_window_days)]
+    peak = window.max() if len(window) else None
+    drawdown = (_jsonf(float(s.iloc[-1]) / float(peak) - 1)
+                if peak is not None and peak > 0 else None)
+
+    return {
+        "as_of": last.strftime("%Y-%m-%d"),
+        "close": _jsonf(s.iloc[-1]),
+        "ma": _jsonf(st["ma"].iloc[-1]),
+        "dist": _jsonf(st["dist"].iloc[-1]),
+        "above": above_out,
+        "days_in_state": days_in_state,
+        "state_since": state_since,
+        "drawdown": drawdown,
+        "ma_days": int(ma_days),
+    }
+
+
+def realized_vol_percentile(benchmark_prices: pd.Series, window: int = 21) -> dict:
+    """Trailing realized vol against the benchmark's own cached history.
+
+    The airgap-safe substitute for a VIX strip: it needs no extra ticker. All
+    fields are None on a series shorter than ``window + 1`` bars.
+    """
+    s = benchmark_prices.dropna()
+    daily = s.pct_change(fill_method=None).dropna()
+    if len(daily) <= window:
+        return {"vol_ann": None, "percentile": None, "n": int(len(daily)),
+                "median": None, "p90": None, "window": int(window)}
+    hist = daily.rolling(window).std().dropna() * np.sqrt(252)
+    current = hist.iloc[-1]
+    return {
+        "vol_ann": _jsonf(current),
+        "percentile": _jsonf((hist <= current).mean()),
+        "n": int(len(hist)),
+        "median": _jsonf(hist.median()),
+        "p90": _jsonf(hist.quantile(0.90)),
+        "window": int(window),
+    }

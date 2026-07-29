@@ -697,6 +697,8 @@ const PARAM_HELP = {
   rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
   skipMonths: 'Months skipped between the ranking window and formation — the window ends this many months before the pick. 1 dodges short-term reversal (classic 12-1 momentum = rank lookback 11 + skip 1).',
   costBps: 'Trading cost in basis points charged on each side of a trade, so replacing the whole book costs twice this. Returns are shown net of it. Set 0 to see gross. Note ETF universes also carry expense-ratio drag that no bps figure captures.',
+  regimeMode: 'Experiment: sit out the month after the benchmark closes below its moving average, holding cash or the benchmark instead. On this history it cut returns by more than half without reducing drawdown, so the banner above the trade list is the useful part. The state is always shown; this only adds the filtered curve.',
+  regimeMaDays: 'Length of the benchmark moving average, in trading bars, that defines the risk-on and risk-off state. 200 is the convention. Longer values invite curve-fitting, so the banner reports its sample size.',
   horizon: 'How many months forward the event study tracks each cohort after selection.',
   benchmark: 'Ticker the strategy is measured against.',
   riskFree: 'Annual risk-free rate (%) subtracted from returns when computing the Sharpe ratio.',
@@ -710,6 +712,8 @@ const DEFAULT_RANGES = {
   rankLookback: { min: 1, max: 12 },
   skipMonths: { min: 0, max: 2 },
   costBps: { min: 0, max: 100 },
+  regimeMaDays: { min: 20, max: 400 },
+  regimeMode: { values: ['off', 'cash', 'benchmark'] },
   horizon: { min: 1, max: 24 },
 };
 
@@ -736,6 +740,16 @@ function paramIssues(params, universesInfo) {
   check('rankLookback', 'Rank lookback', ranges.rankLookback.min, ranges.rankLookback.max);
   check('skipMonths', 'Skip months', skipRange.min, skipRange.max);
   check('costBps', 'Cost (bps)', costRange.min, costRange.max);
+  // Read through the DEFAULT_RANGES fallback: paramIssues uses the server's
+  // ranges whenever /api/universes succeeded, and a key missing there would throw
+  // inside the render path and take the Run button with it.
+  const maRange = ranges.regimeMaDays || DEFAULT_RANGES.regimeMaDays;
+  check('regimeMaDays', 'Regime MA (bars)', maRange.min, maRange.max);
+  // regimeMode is a string, so the Number.isFinite-based check above cannot see it.
+  const modeValues = (ranges.regimeMode || DEFAULT_RANGES.regimeMode).values;
+  if (params.regimeMode != null && !modeValues.includes(params.regimeMode)) {
+    issues.push(`Regime mode must be one of ${modeValues.join(', ')}`);
+  }
   check('horizon', 'Event horizon', ranges.horizon.min, ranges.horizon.max);
   if (!params.benchmark || !String(params.benchmark).trim()) issues.push('Benchmark ticker is required');
   return issues;
@@ -807,6 +821,117 @@ function NumField({ id, label, value, min, max, help, onChange,
 // what to buy, what to sell, what to keep. Latest month first (actionable),
 // older transitions below as history. CSV export for taking it to a broker.
 // ============================================================
+// ============================================================
+// RegimeBanner — what the market is doing, and what happened last time it did
+// this. Evidence only: it never tells the user what to do.
+// ============================================================
+const REGIME_BADGES = {
+  none:   { label: 'NO REGIME DATA', color: '#57534e', bg: '#f5f5f4', border: '#d6d3d1' },
+  off:    { label: 'RISK OFF',       color: '#b45309', bg: '#fffbeb', border: '#fcd34d' },
+  unwind: { label: 'FACTOR UNWIND',  color: '#b91c1c', bg: '#fef2f2', border: '#fecaca' },
+  on:     { label: 'RISK ON',        color: '#047857', bg: '#ecfdf5', border: '#a7f3d0' },
+};
+
+function regimeKind(regime) {
+  // `above` is null for the whole of any run too short to fill the MA window, and
+  // null fails both === false and === true. Without this explicit case the banner
+  // would fall through to a green RISK ON asserting a state the data cannot
+  // support, which is the same fabrication I3 forbids in the series.
+  if (!regime || regime.above == null) return 'none';
+  if (regime.above === false) return 'off';
+  // Market above its average while the strategy bleeds: the drawdown is
+  // momentum-specific, not the market's. mtd is null on a month-end run, so this
+  // must be an optional read.
+  if (regime.mtd && regime.mtd.spread != null && regime.mtd.spread <= -0.05) return 'unwind';
+  return 'on';
+}
+
+function RegimeBanner({ regime, benchmark = 'SPY', theme, compact = false }) {
+  if (!regime) return null;
+  const kind = regimeKind(regime);
+  const badge = REGIME_BADGES[kind];
+  const pct = (v, d = 1, signed = true) => (v == null ? '—' : fmtPct(v, d, signed));
+  const ordinal = (n) => {
+    const r100 = n % 100;
+    if (r100 >= 11 && r100 <= 13) return `${n}th`;
+    return `${n}${['th', 'st', 'nd', 'rd'][n % 10] || 'th'}`;
+  };
+
+  const chip = (
+    <span style={{
+      padding: compact ? '2px 7px' : '3px 9px', fontSize: compact ? 9.5 : 10,
+      fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase',
+      color: badge.color, background: badge.bg,
+      border: `1px solid ${badge.border}`, borderRadius: 4, whiteSpace: 'nowrap',
+    }}>{badge.label}</span>
+  );
+
+  if (compact) {
+    return (
+      <span title={kind === 'none'
+              ? `${benchmark} history is shorter than the ${regime.ma_days}-day average`
+              : `${benchmark} ${pct(regime.dist)} vs its ${regime.ma_days}d average, as of ${regime.as_of}`}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {chip}
+        {regime.dist != null && (
+          <span style={{ fontSize: 10, color: theme.muted,
+                          fontFamily: 'JetBrains Mono, monospace' }}>
+            {pct(regime.dist)}
+          </span>
+        )}
+      </span>
+    );
+  }
+
+  const state = kind === 'none'
+    ? `${benchmark} history covers ${regime.coverage_months ?? 0} months of the ${regime.ma_days}-day average warm-up, so there is no state yet. Raise Lookback.`
+    : (kind === 'off'
+        ? `${benchmark} is ${pct(Math.abs(regime.dist))} below its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, and ${pct(regime.drawdown)} off its 1-year high.`
+        : (kind === 'unwind'
+            ? `${benchmark} is ${pct(regime.dist)} ABOVE its ${regime.ma_days}d average and only ${pct(regime.drawdown)} off its high, so this drawdown is momentum-specific rather than the market's.`
+            : `${benchmark} is ${pct(regime.dist)} above its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, ${pct(regime.drawdown)} off its 1-year high.`));
+
+  // The bucket whose evidence is relevant is the one the CURRENT state implies.
+  const cond = regime.conditional || {};
+  const bucket = kind === 'off' ? cond.risk_off : cond.risk_on;
+  const bucketWord = kind === 'off' ? 'risk-off' : 'risk-on';
+  const evidence = (!bucket || !bucket.n || bucket.mean == null)
+    ? `No comparable months in this window.`
+    : `In the ${bucket.n} prior months that began ${bucketWord}, this sleeve returned ${pct(bucket.mean, 2)}/mo on average against ${pct(bucket.bench_mean, 2)} for ${benchmark} (spread ${pct(bucket.spread_mean, 2)}${bucket.t_stat_spread != null ? `, t=${bucket.t_stat_spread.toFixed(2)}` : ''}).`;
+
+  const v = regime.vol || {};
+  return (
+    <div style={{
+      border: `1px solid ${badge.border}`, background: badge.bg,
+      borderRadius: 6, padding: '10px 12px', marginTop: 8,
+      display: 'flex', flexDirection: 'column', gap: 5,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        {chip}
+        <span style={{ fontSize: 11.5, color: theme.text, lineHeight: 1.5 }}>{state}</span>
+      </div>
+      <div style={{ fontSize: 11, color: theme.muted, lineHeight: 1.55 }}>{evidence}</div>
+      <div style={{ fontSize: 10.5, color: theme.muted,
+                     fontFamily: 'JetBrains Mono, monospace' }}>
+        {regime.mtd && (
+          <>month to date {pct(regime.mtd.strategy, 1)} vs {benchmark} {pct(regime.mtd.benchmark, 1)}
+            {' '}(spread {pct(regime.mtd.spread, 1)}){regime.mtd.is_partial ? ' · partial month' : ''} · </>
+        )}
+        {v.vol_ann != null
+          ? <>{benchmark} {v.window}d vol {pct(v.vol_ann, 1, false)} annualized, {ordinal(Math.round(v.percentile * 100))} percentile of {v.n} bars</>
+          : <>vol percentile unavailable</>}
+        {regime.as_of && <> · regime as of {regime.as_of}</>}
+      </div>
+      {regime.warmup_months > 0 && (
+        <div style={{ fontSize: 10, color: theme.muted }}>
+          First {regime.warmup_months} month{regime.warmup_months === 1 ? '' : 's'} predate
+          {' '}{regime.ma_days}-day average coverage and are counted as invested.
+        </div>
+      )}
+    </div>
+  );
+}
+
 const REBAL_COLORS = {
   buy:  { bg: '#ecfdf5', border: '#a7f3d0', text: '#047857' },
   sell: { bg: '#fef2f2', border: '#fecaca', text: '#b91c1c' },
@@ -920,6 +1045,7 @@ function RebalanceHistoryRow({ r, theme }) {
 // `recordState` (idle|saving|saved|error|exists) plus `recordMessage` report back
 // inline — the ledger panel below is where the record itself is read.
 function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, universe = 'sp500',
+                          regime = null, benchmark = 'SPY',
                           theme, accent, headingFont,
                           onRecord, recordState = 'idle', recordMessage, recordedAsOf }) {
   if (!rebalance || !rebalance.length) return null;
@@ -1022,6 +1148,10 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
       </div>
 
       {/* Latest month — the actionable trades */}
+      {/* The context the trade list was missing: directly above the buy list, so
+          a full-turnover recommendation cannot be read without it. */}
+      <RegimeBanner regime={regime} benchmark={benchmark} theme={theme} />
+
       <div style={{
         border: `1px solid ${theme.border}`, borderRadius: 6,
         padding: '12px 14px', marginTop: 8, background: theme.bg,
@@ -2391,6 +2521,6 @@ Object.assign(window, {
   EquityCurveChart, EventStudyChart, DrawdownChart, MonthlyHeatmap, Sparkline,
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
   PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
-  RebalancePanel, EarningsBreakdown, BuildInfo, WhatsNewModal,
+  RebalancePanel, EarningsBreakdown, BuildInfo, WhatsNewModal, RegimeBanner,
   LedgerPanel, useLedgerRecorder,
 });

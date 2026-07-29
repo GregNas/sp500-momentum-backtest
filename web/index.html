@@ -27,10 +27,10 @@
 
 <!-- ?v bust: bump when a no-build asset changes so any heuristically-cached
      browser copy is replaced; the no-cache header keeps it fresh thereafter. -->
-<script src="data-loader.js?v=8"></script>
-<script type="text/babel" src="charts.jsx?v=8"></script>
-<script type="text/babel" src="v1.jsx?v=8"></script>
-<script type="text/babel" src="v2.jsx?v=8"></script>
+<script src="data-loader.js?v=11"></script>
+<script type="text/babel" src="charts.jsx?v=11"></script>
+<script type="text/babel" src="v1.jsx?v=11"></script>
+<script type="text/babel" src="v2.jsx?v=11"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -43,6 +43,7 @@ const DEFAULT_PARAMS = {
   lookback: 5, topN: 10, holds: [1, 3, 6],
   rankLookback: 1, skipMonths: 0, horizon: 12, benchmark: 'SPY',
   costBps: 10,    // bps charged per side of a trade; 0 shows gross returns
+  regimeMode: 'off', regimeMaDays: 200,   // 'off' adds no filtered series
   riskFree: 0,   // annual risk-free rate (fraction) for Sharpe
 };
 

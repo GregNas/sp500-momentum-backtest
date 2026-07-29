@@ -147,6 +147,43 @@ function V2Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
                 onChange={v => setParam('costBps', v)}
                 theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
 
+      <div>
+        <div style={{ ...labelStyle, display: 'flex', alignItems: 'center', gap: 5 }}>
+          Regime filter
+          <HelpTip help={PARAM_HELP.regimeMode} theme={v2Theme} />
+        </div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[['off', 'off'], ['cash', 'cash'], ['benchmark', 'bench']].map(([v, lbl]) => {
+            const on = (params.regimeMode || 'off') === v;
+            return (
+              <button key={v} onClick={() => setParam('regimeMode', v)}
+                title={v === 'off' ? undefined : 'Experiment: cut returns by more than half on this history'}
+                style={{
+                  flex: 1, padding: '4px 6px', fontSize: 11,
+                  fontFamily: 'JetBrains Mono, monospace',
+                  border: `1px solid ${on ? v2Accent.dark : v2Theme.border}`,
+                  background: on ? v2Accent.dark : '#fff',
+                  color: on ? '#fff' : v2Theme.text,
+                  borderRadius: 3, cursor: 'pointer',
+                }}>{lbl}</button>
+            );
+          })}
+        </div>
+        {(params.regimeMode || 'off') !== 'off' && (
+          <div style={{ fontSize: 10, color: '#b45309', marginTop: 5, lineHeight: 1.45 }}>
+            Experiment. On this window it more than halved returns without reducing
+            drawdown. The banner above the trade list is the useful part.
+          </div>
+        )}
+      </div>
+
+      {(params.regimeMode || 'off') !== 'off' && (
+        <NumField id="v2-mad" label="Regime MA (bars)" value={params.regimeMaDays}
+                  min={20} max={400} help={PARAM_HELP.regimeMaDays}
+                  onChange={v => setParam('regimeMaDays', v)}
+                  theme={v2Theme} labelStyle={labelStyle} inputStyle={inputBase} />
+      )}
+
       <NumField id="v2-horizon" label="Event horizon" value={params.horizon}
                 min={1} max={24} help={PARAM_HELP.horizon}
                 onChange={v => setParam('horizon', v)}
@@ -256,6 +293,7 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
   const [pinnedIdx, setPinnedIdx] = useStateV2(null);
   const [logScale, setLogScale] = useStateV2(true);
   const [filled, setFilled] = useStateV2(true);
+  const [showFiltered, setShowFiltered] = useStateV2(false);
   const [esView, setEsView] = useStateV2('alpha');
   const { isNarrow, isCompact } = useViewport();
 
@@ -272,19 +310,31 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
       name: `top${params.topN}_h${h}m`,
       values: data.EQUITY[`h${h}m`] || data.EQUITY[`h${params.holds[0]}m`],
       color: v2StratColors[`h${h}m`] || v2Accent.color,
-    })).filter(s => s.values).concat([{
+    })).filter(s => s.values).concat(
+      // Filtered sleeves only appear when the experiment is on, and only when the
+      // user asks for them, so the chart does not silently double its line count.
+      showFiltered ? params.holds.map(h => ({
+        name: `top${params.topN}_h${h}m · filtered`,
+        values: data.EQUITY[`h${h}m_filt`],
+        color: v2StratColors[`h${h}m`] || v2Accent.color, dashed: true,
+      })).filter(s => s.values) : []
+    ).concat([{
       name: params.benchmark, values: data.EQUITY.spy,
       color: v2Theme.muted, dashed: true, isBenchmark: true,
     }]);
-  }, [ready, data, params.holds, params.topN, params.benchmark]);
+  }, [ready, data, params.holds, params.topN, params.benchmark, showFiltered]);
 
   const months = useMemoV2(() => {
     if (!ready) return [];
     return data.EQUITY.months.map(s => new Date(s));
   }, [ready, data]);
 
+  // Must stay in step with server.py's REGIME best-sleeve pick (highest Sharpe
+  // among unfiltered non-benchmark rows), or the banner attributes its
+  // month-to-date numbers to a sleeve this header is not showing. Filtered rows
+  // share the unfiltered row's `strategy` label on purpose, so exclude by flag.
   const bestStrat = ready
-    ? data.PERF.filter(p => p.strategy !== params.benchmark)
+    ? data.PERF.filter(p => p.strategy !== params.benchmark && !p.filtered)
                 .sort((a, b) => b.Sharpe - a.Sharpe)[0]
     : null;
   const spy = ready ? data.PERF.find(p => p.strategy === params.benchmark) : null;
@@ -417,6 +467,14 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                                textTransform: 'uppercase' }}>Universe</div>
                 <div style={{ fontSize: 14, fontWeight: 600 }}>{universeSize}</div>
               </div>
+              <div>
+                <div style={{ fontSize: 10, color: v2Theme.muted, letterSpacing: '0.06em',
+                               textTransform: 'uppercase' }}>Regime</div>
+                <div style={{ marginTop: 2 }}>
+                  <RegimeBanner regime={data.REGIME} benchmark={params.benchmark}
+                                theme={v2Theme} compact />
+                </div>
+              </div>
             </div>
           </div>
 
@@ -446,6 +504,14 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                     <input type="checkbox" checked={filled}
                            onChange={e => setFilled(e.target.checked)} />fill
                   </label>
+                  {data.EQUITY[`h${params.holds[0]}m_filt`] && (
+                    <label style={{ display: 'flex', gap: 4, alignItems: 'center',
+                                     cursor: 'pointer', color: '#b45309' }}
+                           title="Regime-filtered sleeves (experiment)">
+                      <input type="checkbox" checked={showFiltered}
+                             onChange={e => setShowFiltered(e.target.checked)} />filt
+                    </label>
+                  )}
                 </div>
               </div>
               <div style={{ height: 260 }}>
@@ -575,12 +641,17 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                                 borderCollapse: 'collapse', marginTop: 6 }}>
                   <tbody>
                     {data.PERF.map(p => (
-                      <tr key={p.strategy} style={{
+                      <tr key={p.strategy + (p.filtered ? '_filt' : '')} style={{
                         color: p.strategy === params.benchmark ? v2Theme.muted : v2Theme.text,
                         borderBottom: `1px solid ${v2Theme.border}`,
                       }}>
                         <td style={{ padding: '4px 0' }}>
                           {p.strategy.replace(/^top\d+_hold/, 'h')}
+                          {p.filtered && (
+                            <span title="Regime-filtered (experiment)"
+                                  style={{ color: '#b45309', fontSize: 9.5,
+                                            marginLeft: 4 }}>filt</span>
+                          )}
                         </td>
                         <td style={{ padding: '4px 0', textAlign: 'right',
                                       fontWeight: 600 }}>{fmtNum(p.Sharpe)}</td>
@@ -743,6 +814,7 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
 
           {/* Monthly rebalance trade list */}
           <RebalancePanel rebalance={data.REBALANCE} topN={params.topN}
+                          regime={data.REGIME} benchmark={params.benchmark}
                           rankLookback={params.rankLookback}
                           skipMonths={params.skipMonths || 0}
                           universe={params.universe || 'sp500'}
