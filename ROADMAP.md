@@ -327,5 +327,35 @@ worth remembering, because both are shapes that will recur:
    whose difference is not an excess return. Chain both legs over the same set and publish the
    coverage counts.
 
-Test count went 45 to 112. **Next: batch 2** (regime filter and crash banner, then earnings flags).
-Its open questions are numbers 11 to 17 above.
+**Batch 2 shipped 2026-07-29** (commits `ab5ba13`, `3146e77`, `4c7b1b8`):
+
+- [Regime filter and live crash banner](docs/superpowers/specs/2026-07-28-regime-filter-crash-banner.md).
+  The banner ships always-on; the filter ships behind an explicit experiment label, because on this
+  window it gives up a lot of return without reliably improving drawdown. On the current cache the
+  badge reads FACTOR UNWIND: the benchmark is 6.5% ABOVE its 200-day average and 2.2% off its high
+  while the best sleeve is deeply negative month to date, so the drawdown is momentum-specific
+  rather than the market's, which is exactly the distinction the feature exists to draw.
+- [Earnings-date flags](docs/superpowers/specs/2026-07-28-earnings-date-flags.md). Badges the live
+  buy and keep names that report before the next month-end rebalance. Currently 3 of 10.
+
+Decisions taken, since they differ from the spec defaults:
+- Q11: the filter ships experiment-labelled, not on by default.
+- Q13: report a warm-up count rather than widening the benchmark price pull.
+- Q15: the warning window is "reports on or before the next month-end rebalance", because the
+  strategy rebalances monthly, so that is the span over which a report lands inside a position
+  taken today. A flat 30 days would warn about reports the next rebalance has already resolved.
+
+The review confirmed 10 defects, fixed in `4c7b1b8`. Two are worth carrying forward as recurring
+shapes: (1) any payload that is a dict of SCALARS is not covered by `_safe_floats`, so it needs its
+own NaN coercion or it 500s, and `pd.NA` is worse than NaN because it silently encodes as an empty
+object that is truthy in JavaScript; (2) a per-ticker network call belongs behind its own endpoint
+called after render, never inline in a synchronous handler, or a cold cache silently adds seconds to
+a response that advertises 0.3s.
+
+Also settled here: the regime mask convention is now fixed in code (a daily average sampled at
+month-end labels by forward fill, giving 13 risk-off month-ends), and under it filtering does NOT
+reduce drawdown. That is what the spec originally claimed; the 22-month sampling noted earlier in
+this file was the outlier.
+
+Test count went 45 to 156. **Next: batch 3** (point-in-time membership), whose open questions are
+numbers 18 to 21 above. Note it will make every headline number worse, which is the point.
