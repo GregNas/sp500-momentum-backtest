@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from lib import analysis, cache, data, ledger, universes
+from lib import analysis, cache, data, earnings, ledger, universes
 
 UniverseKey = Literal["sp500", "global_etfs", "us_sector_etfs"]
 
@@ -568,6 +568,26 @@ def _run_backtest(params: BacktestParams) -> dict:
             traded = (len(r["buys"]) + len(r["sells"])) / params.topN
             r["turnover"] = traded / 2.0
             r["cost_pct"] = params.costBps / 10000.0 * traded
+
+    # ---- Earnings dates for the live trade list ----
+    # Scoped to the names on the live row only, never the universe, and never the
+    # history rows (a forward report date is meaningless on a past month). Optional
+    # decoration: any failure, including no network at all, just means no badge.
+    live_row = rebalance[0] if rebalance else None
+    if live_row is not None and live_row.get("is_live"):
+        watch = list(live_row.get("buys", [])) + list(live_row.get("holds", []))
+        try:
+            dates = earnings.next_earnings(watch)
+        except Exception as exc:
+            dates = {}
+            on_status(f"Earnings dates unavailable ({exc}); badges omitted.")
+        live_row["earnings"] = {t: d for t, d in dates.items() if d}
+        # The rebalance is monthly, so the decision-relevant question is whether a
+        # name reports before the next month-end, while you would still be holding
+        # what you buy today. The UI styles those as warnings.
+        as_of = pd.Timestamp(live_row.get("as_of") or constituents.index.max())
+        live_row["earnings_warn_before"] = (
+            (as_of + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d"))
 
     # ---- Calendar-year (year-over-year) returns per strategy + benchmark ----
     yearly_returns_out: dict = {}

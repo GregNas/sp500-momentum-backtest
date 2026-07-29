@@ -937,8 +937,29 @@ const REBAL_COLORS = {
   sell: { bg: '#fef2f2', border: '#fecaca', text: '#b91c1c' },
 };
 
-function RebalanceChip({ ticker, group, kind, theme, showGroup }) {
+function RebalanceChip({ ticker, group, kind, theme, showGroup,
+                         earningsDate = null, warnBefore = null }) {
   const c = REBAL_COLORS[kind] || { bg: theme.bg, border: theme.border, text: theme.text };
+  // Days to the report, and whether it lands before the next month-end rebalance,
+  // i.e. while you would still be holding what you buy today.
+  let days = null, urgent = false;
+  if (earningsDate) {
+    const d = new Date(earningsDate + 'T00:00:00');
+    days = Math.round((d - new Date(new Date().toDateString())) / 86400000);
+    urgent = warnBefore ? earningsDate <= warnBefore : days <= 30;
+  }
+  const badge = earningsDate && (
+    <span title={`Reports ${earningsDate}${urgent ? ', before the next month-end rebalance' : ''}`}
+          style={{
+            marginLeft: 1, padding: '0 3px', fontSize: 8.5, fontWeight: 700,
+            fontFamily: 'Inter, sans-serif', borderRadius: 2,
+            color: urgent ? '#b45309' : theme.muted,
+            background: urgent ? '#fef3c7' : 'transparent',
+            border: `1px solid ${urgent ? '#fcd34d' : theme.border}`,
+          }}>
+      {days != null && days >= 0 ? `E${days}d` : 'E'}
+    </span>
+  );
   return (
     <span title={group || undefined} style={{
       padding: '2px 7px', fontSize: 11,
@@ -951,6 +972,7 @@ function RebalanceChip({ ticker, group, kind, theme, showGroup }) {
         <span style={{ fontFamily: 'Inter, sans-serif', fontWeight: 400,
                         fontSize: 10, opacity: 0.75 }}>{group}</span>
       )}
+      {badge}
     </span>
   );
 }
@@ -1182,7 +1204,9 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             {colTitle('Buy', latest.buys.length, REBAL_COLORS.buy.text)}
             <div style={chipWrap}>
               {latest.buys.map(t => <RebalanceChip key={t} ticker={t} kind="buy"
-                group={latest.meta?.[t]} theme={theme} showGroup={showGroup} />)}
+                group={latest.meta?.[t]} theme={theme} showGroup={showGroup}
+                earningsDate={latest.earnings?.[t]}
+                warnBefore={latest.earnings_warn_before} />)}
               {!latest.buys.length && <span style={{ fontSize: 11, color: theme.muted, fontStyle: 'italic' }}>nothing to buy</span>}
             </div>
           </div>
@@ -1198,7 +1222,9 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             {colTitle('Keep', latest.holds.length, theme.muted)}
             <div style={chipWrap}>
               {latest.holds.map(t => <RebalanceChip key={t} ticker={t} kind="keep"
-                group={latest.meta?.[t]} theme={theme} showGroup={showGroup} />)}
+                group={latest.meta?.[t]} theme={theme} showGroup={showGroup}
+                earningsDate={latest.earnings?.[t]}
+                warnBefore={latest.earnings_warn_before} />)}
             </div>
           </div>
         </div>
