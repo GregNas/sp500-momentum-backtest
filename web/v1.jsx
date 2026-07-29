@@ -138,7 +138,7 @@ function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
               const on = (params.regimeMode || 'off') === v;
               return (
                 <button key={v} onClick={() => setParam('regimeMode', v)}
-                  title={v === 'off' ? undefined : 'Experiment: cut returns by more than half on this history'}
+                  title={v === 'off' ? undefined : 'Experiment: gave up substantial return on this history'}
                   style={{
                     flex: 1, padding: '5px 6px', fontSize: 11,
                     fontFamily: 'JetBrains Mono, monospace',
@@ -152,8 +152,8 @@ function V1Sidebar({ params, setParam, onRun, running, elapsed, cacheInfo, cache
           </div>
           {(params.regimeMode || 'off') !== 'off' && (
             <div style={{ fontSize: 10, color: '#b45309', marginTop: 5, lineHeight: 1.45 }}>
-              Experiment. On this window the filter more than halved returns without
-              reducing drawdown. The banner above the trade list is the useful part.
+              Experiment. On this window it gave up a lot of return without reliably
+              improving drawdown. Compare the curves before trusting it.
             </div>
           )}
         </div>

@@ -697,7 +697,7 @@ const PARAM_HELP = {
   rankLookback: 'Trailing window (months) of return used to rank momentum each month.',
   skipMonths: 'Months skipped between the ranking window and formation — the window ends this many months before the pick. 1 dodges short-term reversal (classic 12-1 momentum = rank lookback 11 + skip 1).',
   costBps: 'Trading cost in basis points charged on each side of a trade, so replacing the whole book costs twice this. Returns are shown net of it. Set 0 to see gross. Note ETF universes also carry expense-ratio drag that no bps figure captures.',
-  regimeMode: 'Experiment: sit out the month after the benchmark closes below its moving average, holding cash or the benchmark instead. On this history it cut returns by more than half without reducing drawdown, so the banner above the trade list is the useful part. The state is always shown; this only adds the filtered curve.',
+  regimeMode: 'Experiment: sit out the month after the benchmark closes below its moving average, holding cash or the benchmark instead. On this history it gave up a lot of return without reliably improving drawdown, so the banner above the trade list is the useful part. Compare the curves yourself rather than trusting the label. The state is always shown; this only adds the filtered series.',
   regimeMaDays: 'Length of the benchmark moving average, in trading bars, that defines the risk-on and risk-off state. 200 is the convention. Longer values invite curve-fitting, so the banner reports its sample size.',
   horizon: 'How many months forward the event study tracks each cohort after selection.',
   benchmark: 'Ticker the strategy is measured against.',
@@ -851,6 +851,9 @@ function RegimeBanner({ regime, benchmark = 'SPY', theme, compact = false }) {
   const kind = regimeKind(regime);
   const badge = REGIME_BADGES[kind];
   const pct = (v, d = 1, signed = true) => (v == null ? '—' : fmtPct(v, d, signed));
+  // Math.abs(null) is 0, which would print "0.0%" instead of an em-dash, so the
+  // null has to survive the abs.
+  const absOrNull = (v) => (v == null ? null : Math.abs(v));
   const ordinal = (n) => {
     const r100 = n % 100;
     if (r100 >= 11 && r100 <= 13) return `${n}th`;
@@ -885,11 +888,14 @@ function RegimeBanner({ regime, benchmark = 'SPY', theme, compact = false }) {
 
   const state = kind === 'none'
     ? `${benchmark} history covers ${regime.coverage_months ?? 0} months of the ${regime.ma_days}-day average warm-up, so there is no state yet. Raise Lookback.`
+    // The words already carry the direction, so these read unsigned: "+6.5%
+    // ABOVE" and "-2.2% off its high" both say the same thing twice, and the
+    // second is wrong-looking.
     : (kind === 'off'
-        ? `${benchmark} is ${pct(Math.abs(regime.dist))} below its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, and ${pct(regime.drawdown)} off its 1-year high.`
+        ? `${benchmark} is ${pct(absOrNull(regime.dist), 1, false)} below its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, and ${pct(absOrNull(regime.drawdown), 1, false)} off its 1-year high.`
         : (kind === 'unwind'
-            ? `${benchmark} is ${pct(regime.dist)} ABOVE its ${regime.ma_days}d average and only ${pct(regime.drawdown)} off its high, so this drawdown is momentum-specific rather than the market's.`
-            : `${benchmark} is ${pct(regime.dist)} above its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, ${pct(regime.drawdown)} off its 1-year high.`));
+            ? `${benchmark} is ${pct(regime.dist, 1, false)} above its ${regime.ma_days}d average and only ${pct(absOrNull(regime.drawdown), 1, false)} off its high, so this drawdown is momentum-specific rather than the market's.`
+            : `${benchmark} is ${pct(regime.dist, 1, false)} above its ${regime.ma_days}d average, ${regime.days_in_state ?? '—'} days now, ${pct(absOrNull(regime.drawdown), 1, false)} off its 1-year high.`));
 
   // The bucket whose evidence is relevant is the one the CURRENT state implies.
   const cond = regime.conditional || {};
@@ -922,10 +928,12 @@ function RegimeBanner({ regime, benchmark = 'SPY', theme, compact = false }) {
           : <>vol percentile unavailable</>}
         {regime.as_of && <> · regime as of {regime.as_of}</>}
       </div>
-      {regime.warmup_months > 0 && (
+      {/* Only claim filter behaviour while the filter is actually running: with
+          the mode off nothing is being counted as invested or otherwise. */}
+      {regime.mode && regime.mode !== 'off' && regime.warmup_months > 0 && (
         <div style={{ fontSize: 10, color: theme.muted }}>
           First {regime.warmup_months} month{regime.warmup_months === 1 ? '' : 's'} predate
-          {' '}{regime.ma_days}-day average coverage and are counted as invested.
+          {' '}{regime.ma_days}-day average coverage and are held invested rather than filtered.
         </div>
       )}
     </div>
@@ -948,7 +956,10 @@ function RebalanceChip({ ticker, group, kind, theme, showGroup,
     days = Math.round((d - new Date(new Date().toDateString())) / 86400000);
     urgent = warnBefore ? earningsDate <= warnBefore : days <= 30;
   }
-  const badge = earningsDate && (
+  // A date already in the past gets no badge at all rather than an urgent one:
+  // the report has happened, so there is nothing to warn about. An unparseable
+  // date yields NaN, which fails this guard and also degrades to no badge.
+  const badge = earningsDate && days != null && days >= 0 && (
     <span title={`Reports ${earningsDate}${urgent ? ', before the next month-end rebalance' : ''}`}
           style={{
             marginLeft: 1, padding: '0 3px', fontSize: 8.5, fontWeight: 700,
@@ -1070,8 +1081,26 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
                           regime = null, benchmark = 'SPY',
                           theme, accent, headingFont,
                           onRecord, recordState = 'idle', recordMessage, recordedAsOf }) {
+  // Earnings dates the server had cached arrive with the backtest; anything it
+  // did not are fetched here, after render, so a cold lookup never delays the
+  // dashboard. Keyed by the row so a new run discards the previous answers.
+  const [lateEarnings, setLateEarnings] = useState({});
+  const liveRow = (rebalance && rebalance.length) ? rebalance[0] : null;
+  const watchKey = liveRow ? (liveRow.earnings_watch || []).join(',') : '';
+  useEffect(() => {
+    setLateEarnings({});
+    if (!liveRow || !liveRow.is_live) return;
+    const watch = liveRow.earnings_watch || [];
+    const missing = watch.filter(t => !(liveRow.earnings || {})[t]);
+    if (!missing.length || typeof fetchEarnings !== 'function') return;
+    let live = true;
+    fetchEarnings(missing).then(found => { if (live) setLateEarnings(found || {}); });
+    return () => { live = false; };
+  }, [watchKey]);
+
   if (!rebalance || !rebalance.length) return null;
   const latest = rebalance[0];
+  const earningsFor = (t) => (latest.earnings || {})[t] || lateEarnings[t] || null;
   const history = rebalance.slice(1);
   const showGroup = universe !== 'sp500';
 
@@ -1205,7 +1234,7 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             <div style={chipWrap}>
               {latest.buys.map(t => <RebalanceChip key={t} ticker={t} kind="buy"
                 group={latest.meta?.[t]} theme={theme} showGroup={showGroup}
-                earningsDate={latest.earnings?.[t]}
+                earningsDate={earningsFor(t)}
                 warnBefore={latest.earnings_warn_before} />)}
               {!latest.buys.length && <span style={{ fontSize: 11, color: theme.muted, fontStyle: 'italic' }}>nothing to buy</span>}
             </div>
@@ -1223,7 +1252,7 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
             <div style={chipWrap}>
               {latest.holds.map(t => <RebalanceChip key={t} ticker={t} kind="keep"
                 group={latest.meta?.[t]} theme={theme} showGroup={showGroup}
-                earningsDate={latest.earnings?.[t]}
+                earningsDate={earningsFor(t)}
                 warnBefore={latest.earnings_warn_before} />)}
             </div>
           </div>

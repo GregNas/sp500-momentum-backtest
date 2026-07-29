@@ -364,7 +364,13 @@ def _run_backtest(params: BacktestParams) -> dict:
                                        ma_days=params.regimeMaDays)
     filtered_returns: dict[int, pd.Series] = {}
     if params.regimeMode != "off":
-        repl = 0.0 if params.regimeMode == "cash" else benchmark_monthly
+        # A month the benchmark cannot price must not become a NaN hole in the
+        # filtered sleeve. perf_stats drops NaN, so a sleeve reduced to one
+        # observation gets NaN vol and Sharpe, and NaN in the response is a 500.
+        # Holding cash through an unpriceable month is also the honest reading:
+        # "no benchmark data" is not "the benchmark returned something unknown".
+        repl = (0.0 if params.regimeMode == "cash"
+                else benchmark_monthly.reindex(monthly.index).fillna(0.0))
         for h, r in strategy_returns.items():
             filtered_returns[h] = analysis.apply_regime(r, regime_mask, repl)
 
@@ -442,7 +448,10 @@ def _run_backtest(params: BacktestParams) -> dict:
         perf_rows.append({
             "strategy": f"top{params.topN}_hold{h}m",
             "filtered": True,
-            **{k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
+            # Through _num, not a bare float(): a filtered sleeve can be reduced
+            # to a single observation, whose vol and Sharpe are NaN, and NaN
+            # anywhere in the response is a 500.
+            **{k: (_num(v) if isinstance(v, (float, np.floating)) else v)
                for k, v in s.items()},
         })
     bench_stats = analysis.perf_stats(bench_aligned, risk_free_annual=params.riskFree)
@@ -502,8 +511,13 @@ def _run_backtest(params: BacktestParams) -> dict:
     regime = analysis.regime_snapshot(benchmark_prices, ma_days=params.regimeMaDays)
     regime["mode"] = params.regimeMode
     regime["vol"] = analysis.realized_vol_percentile(benchmark_prices)
-    decision = regime_mask.shift(1)
-    regime["warmup_months"] = int(regime_mask.isna().sum())
+    # Warm-up months that actually reach a sleeve, on the strategy's own index.
+    # Counting NA across the whole monthly index would include the ranking
+    # warm-up months the backtest never traded, so the banner would claim
+    # unfiltered exposure the filtered curve does not have and contradict
+    # conditional.warmup.n in the same payload.
+    regime["warmup_months"] = int(
+        regime_mask.shift(1).reindex(first_returns.index).isna().sum())
     regime["coverage_months"] = int(regime_mask.notna().sum())
     # Month-END labels where the signal read risk-off, i.e. DECISION dates: an
     # entry of "2022-02" means 2022-02 closed below the average, so 2022-03 is
@@ -516,9 +530,16 @@ def _run_backtest(params: BacktestParams) -> dict:
     regime["mtd"] = None
     regime["conditional"] = None
     if best_h is not None:
-        regime["conditional"] = analysis.regime_conditional_stats(
-            strategy_returns[best_h], regime_mask, benchmark_monthly)
         sleeve = strategy_returns[best_h].dropna()
+        # The in-progress month is reported separately as mtd. Folding it into the
+        # historical buckets would count the same partial return as both the
+        # evidence and the event it is evidence about, and it is usually the
+        # extreme observation that put the banner in that state to begin with.
+        history = (sleeve.iloc[:-1]
+                   if len(sleeve) and constituents.index.max() < sleeve.index[-1]
+                   else sleeve)
+        regime["conditional"] = analysis.regime_conditional_stats(
+            history, regime_mask, benchmark_monthly)
         if len(sleeve):
             label = sleeve.index[-1]
             regime["mtd"] = {
@@ -576,12 +597,17 @@ def _run_backtest(params: BacktestParams) -> dict:
     live_row = rebalance[0] if rebalance else None
     if live_row is not None and live_row.get("is_live"):
         watch = list(live_row.get("buys", [])) + list(live_row.get("holds", []))
+        # Cache only here. This runs inline in a synchronous handler, so a cold
+        # fetch would add seconds to a response that otherwise reports 0.3s, for
+        # decoration. The client calls POST /api/earnings after it has rendered,
+        # which is the path allowed to touch the network.
         try:
-            dates = earnings.next_earnings(watch)
+            dates = earnings.next_earnings(watch, allow_network=False)
         except Exception as exc:
             dates = {}
             on_status(f"Earnings dates unavailable ({exc}); badges omitted.")
         live_row["earnings"] = {t: d for t, d in dates.items() if d}
+        live_row["earnings_watch"] = watch
         # The rebalance is monthly, so the decision-relevant question is whether a
         # name reports before the next month-end, while you would still be holding
         # what you buy today. The UI styles those as warnings.
@@ -782,6 +808,30 @@ def version_info() -> dict:
 def whats_new() -> dict:
     """Commits from WHATS_NEW_SINCE onward, newest first."""
     return {"entries": WHATS_NEW, "since": WHATS_NEW_SINCE, "source": WHATS_NEW_SOURCE}
+
+
+class EarningsParams(BaseModel):
+    # Capped well below the module's own MAX_SYMBOLS so a crafted request cannot
+    # turn into hundreds of per-ticker calls.
+    tickers: List[str] = Field(default_factory=list, max_length=40)
+
+
+@app.post("/api/earnings")
+def earnings_dates(params: EarningsParams) -> dict:
+    """Next earnings date per ticker. The one path allowed to hit the network.
+
+    Called by the client after the dashboard has rendered, so a cold fetch never
+    delays the backtest itself. Failures are reported as an empty mapping rather
+    than an error status: the badges are decoration and must never look broken.
+    """
+    tickers = [t.strip().upper() for t in params.tickers if t and t.strip()]
+    if not tickers:
+        return {"earnings": {}, "source": "empty"}
+    try:
+        dates = earnings.next_earnings(tickers)
+    except Exception as exc:
+        return {"earnings": {}, "source": "unavailable", "detail": str(exc)}
+    return {"earnings": {t: d for t, d in dates.items() if d}, "source": "ok"}
 
 
 @app.get("/api/cache")

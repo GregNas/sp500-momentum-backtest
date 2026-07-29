@@ -20,9 +20,15 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+# Imported for its module-scope _ensure_ssl_trust(), which exports the OS trust
+# store so requests through a TLS-inspecting corporate proxy succeed. yfinance is
+# imported lazily inside _fetch_one, so without this the first earnings call could
+# be the first yfinance use in the process and would fail certificate validation.
+from lib import data as _data  # noqa: F401
 
 CACHE_DIR = Path("./cache")
 EARNINGS_JSON = CACHE_DIR / "earnings_dates.json"
@@ -58,13 +64,24 @@ def _fresh(entry: dict) -> bool:
 
 
 def load_cached(tickers) -> dict[str, str | None]:
-    """Cached next-earnings dates for the tickers whose entries are still fresh."""
+    """Cached next-earnings dates for the tickers whose entries are still fresh.
+
+    A cached date that has since passed counts as a miss, not a hit. Inside the
+    TTL the stored value is "the next report", and once that day arrives the next
+    one is a different date; serving the old one would render a report as
+    upcoming after it has happened.
+    """
     raw = _load_raw()
+    today = date.today().isoformat()
     out: dict[str, str | None] = {}
     for t in tickers:
         entry = raw.get(t)
-        if isinstance(entry, dict) and _fresh(entry):
-            out[t] = entry.get("date")
+        if not (isinstance(entry, dict) and _fresh(entry)):
+            continue
+        cached = entry.get("date")
+        if cached is not None and cached < today:
+            continue
+        out[t] = cached
     return out
 
 
@@ -128,18 +145,24 @@ def next_earnings(tickers, allow_network: bool = True) -> dict[str, str | None]:
         return out
 
     fetched: dict[str, str | None] = {}
-    deadline = datetime.now(timezone.utc) + timedelta(seconds=BUDGET_S)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    # A single bounded wait on the whole batch. `as_completed` without a timeout
+    # would block indefinitely on a hung request, and exiting a `with
+    # ThreadPoolExecutor` block calls shutdown(wait=True), which waits for every
+    # remaining future and so would defeat the budget even after a break. Threads
+    # left running are daemon-free but harmless: they finish into nothing, and the
+    # process is a single-user local server.
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
         futures = {pool.submit(_fetch_one, t): t for t in missing}
-        for fut in as_completed(futures):
-            remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
-            if remaining <= 0:
-                break
+        done, _pending = wait(set(futures), timeout=BUDGET_S)
+        for fut in done:
             try:
-                fetched[futures[fut]] = fut.result(timeout=max(0.1, remaining))
+                fetched[futures[fut]] = fut.result()
             except Exception:
-                # Includes the per-future timeout. A missing date is not an error.
+                # A missing date is not an error; the ticker just gets no badge.
                 continue
+    finally:
+        pool.shutdown(wait=False)
     if fetched:
         _save(fetched)
     out.update(fetched)

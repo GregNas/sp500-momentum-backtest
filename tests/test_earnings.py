@@ -195,3 +195,38 @@ def test_days_until_counts_from_a_given_date():
 @pytest.mark.parametrize("bad", [None, "", "not-a-date", "2026-13-40"])
 def test_days_until_is_none_on_unusable_input(bad):
     assert earnings.days_until(bad) is None
+
+
+# ---- regression: the review findings ----
+
+def test_a_cached_date_that_has_passed_is_a_miss(cache_dir):
+    """Inside the TTL the stored value means "the next report". Once that day has
+    passed the next one is a different date, so serving the old one would show a
+    report as upcoming after it happened."""
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    _write(earnings.EARNINGS_JSON, {
+        "PAST": {"date": yesterday, "fetched_at": _stamp(1)},
+        "SOON": {"date": tomorrow, "fetched_at": _stamp(1)},
+    })
+    out = earnings.load_cached(["PAST", "SOON"])
+    assert "PAST" not in out
+    assert out["SOON"] == tomorrow
+
+
+def test_the_budget_is_actually_enforced(cache_dir, monkeypatch):
+    """as_completed with no timeout, or exiting a `with ThreadPoolExecutor` block,
+    would wait for every future and defeat the budget."""
+    import time as _time
+    monkeypatch.setattr(earnings, "BUDGET_S", 0.4)
+
+    def slow(t):
+        _time.sleep(30)
+        return "2026-09-09"
+
+    monkeypatch.setattr(earnings, "_fetch_one", slow)
+    t0 = _time.monotonic()
+    out = earnings.next_earnings(["AAA", "BBB"])
+    elapsed = _time.monotonic() - t0
+    assert elapsed < 5, f"budget not enforced: took {elapsed:.1f}s"
+    assert out == {}          # nothing arrived, so no badges

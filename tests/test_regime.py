@@ -199,3 +199,36 @@ def test_server_num_coerces_every_nonfinite_to_none():
     for bad in (np.nan, np.inf, -np.inf, None, pd.NA, "x"):
         assert server._num(bad) is None
     assert server._num(np.float64(1.5)) == 1.5
+
+
+# ---- regression: the review findings ----
+
+def test_conditional_excludes_the_in_progress_month(tmp_path):
+    """The partial month is reported separately as mtd. Folding it into the
+    historical buckets counts the same return as both evidence and event, and it
+    is usually the extreme observation that selected that bucket to begin with."""
+    idx = _months(6)
+    r = pd.Series([0.01, 0.02, 0.03, 0.04, 0.05, -0.50], index=idx)
+    bench = pd.Series([0.0] * 6, index=idx)
+    mask = pd.Series([True] * 6, index=idx, dtype="boolean")
+    with_partial = analysis.regime_conditional_stats(r, mask, bench)
+    without = analysis.regime_conditional_stats(r.iloc[:-1], mask, bench)
+    assert with_partial["risk_on"]["n"] == 5      # months 1..5
+    assert without["risk_on"]["n"] == 4
+    # The -50% stub drags the mean hard, which is the distortion being avoided.
+    assert with_partial["risk_on"]["mean"] < without["risk_on"]["mean"]
+
+
+def test_apply_regime_never_introduces_nan_from_the_replacement():
+    """A month the benchmark cannot price must not become a NaN hole: perf_stats
+    drops NaN, so a sleeve cut to one observation gets NaN vol, and NaN anywhere
+    in a response is a 500."""
+    idx = _months(4)
+    r = pd.Series([0.10] * 4, index=idx)
+    bench_with_gap = pd.Series([0.01, np.nan, 0.03, 0.04], index=idx)
+    mask = pd.Series([False] * 4, index=idx, dtype="boolean")
+    # Server-side contract: the replacement is filled before it is handed over.
+    out = analysis.apply_regime(r, mask, bench_with_gap.fillna(0.0))
+    assert out.notna().all()
+    stats = analysis.perf_stats(out)
+    assert all(np.isfinite(stats[k]) for k in ("vol", "Sharpe", "total_return"))

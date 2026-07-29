@@ -91,6 +91,25 @@ async function fetchLedger(opts) {
   return await r.json();
 }
 
+// Next earnings dates. Called after the dashboard renders, never before: this is
+// the only request that may hit the network per-ticker, and the badges it feeds
+// are decoration. Any failure resolves to an empty mapping.
+async function fetchEarnings(tickers) {
+  if (!tickers || !tickers.length) return {};
+  try {
+    const r = await fetch('/api/earnings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tickers }),
+    });
+    if (!r.ok) return {};
+    const body = await r.json();
+    return body.earnings || {};
+  } catch (e) {
+    return {};
+  }
+}
+
 async function fetchCacheInfo() {
   const r = await fetch('/api/cache');
   if (!r.ok) return null;
@@ -163,6 +182,7 @@ function fmtAge(hours) {
 
 Object.assign(window, {
   runBacktest, fetchTopPerformers, fetchCacheInfo, fetchUniverses, clearCache,
+  fetchEarnings,
   fetchVersion, fetchWhatsNew, recordLedgerTarget, fetchLedger,
   fmtMonthShort, fmtMonthYear, fmtPct, fmtMult, fmtGrowthPct, fmtEquityAxis,
   fmtNum, fmtAge,
