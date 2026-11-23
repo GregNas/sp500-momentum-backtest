@@ -84,6 +84,37 @@ One more thing the re-measurement surfaced: `SPY`'s last cached bar is NaN while
 
 ---
 
+## Batch 2b - Evidence checks, and restart the ledger
+
+Added 2026-11-18, after batches 1 and 2 shipped. Status: Approved, not built. Suggested position: before batch 3.
+
+| | |
+|---|---|
+| **Specs** | [Ledger reminder and missed-month backfill](docs/superpowers/specs/2026-11-18-ledger-reminder-backfill.md) (S), then [Equal-weight universe baseline](docs/superpowers/specs/2026-11-18-equal-weight-universe-baseline.md) (S), [Beta, alpha and information ratio](docs/superpowers/specs/2026-11-18-beta-alpha-information-ratio.md) (S), [Rank-bucket returns](docs/superpowers/specs/2026-11-18-rank-bucket-returns.md) (S) |
+| **Effort** | S + S + S + S |
+| **Deps** | The ledger spec depends on the shipped ledger. The other 3 depend on nothing. |
+
+**Why these go together.** All 4 answer one question: is the measured edge real? The ledger is the out-of-sample answer, and it stopped. The other 3 are in-sample checks the dashboard lacks. None of them edits `momentum_signal`, `momentum_backtest_detail` or `perf_stats`, so the batch stays clear of the signal work in batches 3 and 4. All 4 add response keys only.
+
+**Why before batch 3.**
+
+- The ledger has 1 entry (2026-07-27) and the price cache ends at 2026-08-21. 3 month-ends passed with no record. Under the spec, a gap is fillable only until the current month gets a live entry. So build the ledger spec before the next Record click, or record with the gap and accept it.
+- The other 3 are small, and they change how every later result is read. Batch 3 will lower the headline numbers. A baseline, a beta and a bucket chart show which part of the fall is selection and which part was never selection.
+
+**What you can newly do.** See on page open that a target is due. Fill missed month-ends with labeled reconstructed targets, with the live-only total beside the combined one. Compare each sleeve against the equal-weight average of its own universe. Read beta and a regression alpha in place of a CAGR subtraction. See average return across the whole ranking, with the top N as its own bar.
+
+**Watch for.**
+
+- No spec adds a `PERF` row. A new row is eligible for the best-sleeve pick in 3 places (`v1.jsx:349`, `v2.jsx:336`, `server.py:506`).
+- 3 of the specs exclude the in-progress month with the same test (`constituents.index.max() < label`). Write it once.
+- The regression must use the unfilled benchmark series. `bench_aligned` carries invented 0.0 months for the equity curve.
+- Rank buckets become a 6th consumer of `momentum_signal`. Batches 3 and 4 must thread their new arguments through it. The baseline needs the batch 3 member mask, or it stops being comparable.
+- All 4 specs bump `?v=`. Built in one pass, that is 1 bump.
+
+**Provenance.** Every figure in these 4 specs was measured on 2026-11-18 against `cache/prices.parquet`. The frame held 497 priced S&P 500 columns from 2011-05-02 to 2026-08-21. The settings were top 10, 1-month rank and 10 bps per side, with the partial August 2026 month excluded. The measurement scripts are not in the repo. All figures use today's member list, so they are upper bounds until batch 3 ships. One claim is not measured: that a real equal-weight fund trailed SPY over the same period.
+
+---
+
 ## Batch 3 - Point-in-time membership
 
 | | |
@@ -188,6 +219,15 @@ One more thing the re-measurement surfaced: `SPY`'s last cached bar is NaN while
 | [Portfolio tracker with sized trades](docs/superpowers/specs/2026-07-28-portfolio-tracker-sized-trades.md) | M | 6 | Converts the target into share counts against your own book, with a funded trade sequence. |
 | [Parameter-sweep heatmap](docs/superpowers/specs/2026-07-28-parameter-sweep-heatmap.md) | M | 7 | Shows the whole parameter surface, with anti-overfitting machinery as a shipped feature. |
 
+### Added 2026-11-18
+
+| Spec | Effort | Batch | Value in one line |
+|---|---|---|---|
+| [Ledger reminder and missed-month backfill](docs/superpowers/specs/2026-11-18-ledger-reminder-backfill.md) | S | 2b | Restarts the only out-of-sample record, and keeps a gap from turning into a 4-month hold. |
+| [Equal-weight universe baseline](docs/superpowers/specs/2026-11-18-equal-weight-universe-baseline.md) | S | 2b | A yardstick with the same names and weighting as the strategy: 17.4%/yr against 13.9% for SPY. |
+| [Beta, alpha and information ratio](docs/superpowers/specs/2026-11-18-beta-alpha-information-ratio.md) | S | 2b | Replaces a CAGR subtraction labeled alpha with a regression. Hold6 beta is 1.35 to 1.50. |
+| [Rank-bucket returns](docs/superpowers/specs/2026-11-18-rank-bucket-returns.md) | S | 2b | Shows that 9 of 10 deciles have no ordering and the edge sits in the top 10 names. |
+
 ---
 
 ## Decisions needed from the user
@@ -268,6 +308,34 @@ Ledger:
 49. Third metric: max drawdown (likely near-flat, most cells share the 2022 drawdown), Calmar, or the 5th-percentile month?
 50. Benchmark anchoring: one benchmark measured over the longest eligible cell's index (specced, so a 50-month cell is scored against a 61-month benchmark), or recompute per cell window and accept a colour scale whose neutral point moves?
 51. Add a per-axis note that long-`rankLookback` cells are the most survivorship-biased? The caveat and neighbour readout do not address that at all today.
+
+### Before or during batch 2b
+
+**All 11 answered by the owner on 2026-11-18.** Each answer is the specced option, so the 4 specs
+are Status: Approved. Each spec lists its answers under Decisions.
+
+Ledger reminder and backfill:
+
+52. Gap policy at Record time: ask each time (specced), always backfill, or never?
+53. The 12-month cap on one backfill: keep, change, or remove?
+54. Do reconstructed segments count toward the 12-segment annualization gate? Specced yes, with the label beside the figure. The strict alternative counts live segments only.
+55. Stale prices with no month due: does the reminder fire? Specced no.
+
+Equal-weight baseline:
+
+56. Charge the baseline its own rebalance cost? Specced no. A gross baseline is higher, so the error is against the strategy.
+57. Does the headline lead with excess over the baseline, or stay on excess over the benchmark? Specced: benchmark first, baseline second.
+
+Beta and alpha:
+
+58. Add Sortino and Calmar in the same pass? Specced no, because they belong in `perf_stats`, which the spec does not edit.
+59. Report beta and alpha against the equal-weight baseline too? Specced no.
+
+Rank buckets:
+
+60. Add a horizon that matches the longest selected hold? Specced: 1 month only.
+61. Terciles for universes under 25 names, so the 11 sector ETFs get a chart? Specced no.
+62. Medians beside means on the chart? Specced: mean on the bar, median in the tooltip.
 
 ---
 
@@ -359,3 +427,42 @@ this file was the outlier.
 
 Test count went 45 to 156. **Next: batch 3** (point-in-time membership), whose open questions are
 numbers 18 to 21 above. Note it will make every headline number worse, which is the point.
+
+**Batch 2b approved 2026-11-18.** A review of the shipped features found the ledger stopped after
+1 entry, and measured 3 in-sample checks the dashboard lacks. 4 specs are written. The owner
+answered questions 52 to 62 the same day with the specced option in each case, so all 4 are
+Status: Approved. Nothing is built yet. Suggested order is batch 2b, then batch 3.
+
+**Ledger reminder and backfill built 2026-11-18** (first of the 4 specs in batch 2b). The other
+3 are not built. 22 tests were added, and the suite went from 156 to 177. The flow was checked in
+the browser against an offline copy of the cache and a seeded ledger, never the real one.
+
+Decisions taken during the build, since the spec left them open:
+- The reminder follows the most recently recorded settings group. An old experiment under other
+  settings does not keep the reminder on.
+- The reminder sits once above the dashboard body, so it shows with and without a run.
+- The reminder counts months on the server date. The Record prompt counts them on the price
+  frame. With stale prices the 2 counts differ, and the reminder states where the prices end.
+
+Found during the build:
+- Not fixed: 2 tests in `tests/test_earnings.py` fail because their fixtures use fixed dates
+  (2026-08-01 and 2026-09-09) that are now in the past.
+- Fixed the same day: a partial price fetch left a hole that was never refetched.
+  `prices_meta.json` stores one end date for the whole frame. A fetch that returned bars for 4
+  new tickers only moved that end to 2026-11-17 for all 497, and the later-range fetch then
+  skipped the rest. `cache.get_prices_cached` now finds each requested ticker that stops more than
+  5 days before the frame's end and fills it from its own last bar, at most once per 6 hours per
+  ticker, with the seam checked for a split. The ledger record path treats such a hole as stale.
+  A trial on a copy of the real cache filled all 497 in 35 s. Tests: `tests/test_cache_lag.py`.
+- Fixed on 2026-11-23: the gap fill asks Yahoo for bars up to the day after the requested end.
+  On 2026-11-18 at 14:03 New York time it stored that day's open session as a final close. Every
+  fetch in `cache.get_prices_cached` now drops a bar for today (New York date) until 16:30 New
+  York time. The later-range fetch also re-pulls the last 2 cached days, like the tail refetch
+  did. Before, it started after the cached end and never replaced a wrong last bar. The refresh
+  on the real cache moved the 2026-11-18 close of SPY from 731.69 to 730.20. Tests:
+  `tests/test_cache_session.py`.
+
+The same review measured 2 more ideas that have no spec yet: a concentration readout with an
+optional sector cap, and a volatility target. It tested a rank buffer and dropped it: on the
+1-month signal turnover fell only from 1118% to 956% a year, and on the 12-1 signal Sharpe fell
+from 1.37 to 1.23. The hold sleeves already cut turnover better.
