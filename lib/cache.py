@@ -38,6 +38,44 @@ TAIL_FRESH_HOURS = 6      # skip the tail refetch when the cache was written thi
 SPLIT_JUMP_HI = 1.40
 SPLIT_JUMP_LO = 0.72
 
+# A ticker whose last bar sits more than this many calendar days before the
+# frame's last bar has a hole at the tail. The meta stores one end date for the
+# whole frame, so a fetch that returns new bars for a few tickers only moves that
+# end for all of them, and the range-based delta never asks for the rest again.
+# 5 days keeps a normal 1-bar benchmark lag and a long weekend out.
+LAG_TOLERANCE_DAYS = 5
+# A lagging ticker is re-requested at most once per this window. A delisted name
+# or a Yahoo outage must not cost a fetch on every call.
+LAG_RETRY_HOURS = 6
+
+# Yahoo serves the bar of a session that is still open, and its close then
+# changes until the session ends. Such a bar must never reach the cache: the
+# ledger would store a mid-session price for good. A bar counts as final once
+# New York time passes this hour. Early-close days only wait a little longer.
+SESSION_TZ = "America/New_York"
+SESSION_SETTLED_HOUR = 16.5
+
+
+def _now_session() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=SESSION_TZ)
+
+
+def first_unsettled_day(now: pd.Timestamp | None = None) -> pd.Timestamp:
+    """The first date whose bar can still change: today in New York until the
+    session settles, tomorrow after that."""
+    now = _now_session() if now is None else now
+    day = pd.Timestamp(now.date())
+    settled = now.hour + now.minute / 60 >= SESSION_SETTLED_HOUR
+    return day + timedelta(days=1) if settled else day
+
+
+def drop_unsettled(prices: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    return prices.loc[prices.index < first_unsettled_day(now)]
+
+
+def _settled(fetcher: Callable[[list[str], str, str], pd.DataFrame]):
+    return lambda tickers, start, end: drop_unsettled(fetcher(tickers, start, end))
+
 
 # ---------- tickers ----------
 
@@ -136,17 +174,42 @@ def atomic_write(dest: Path, write: Callable[[Path], None]) -> None:
 _atomic_write = atomic_write
 
 
-def _save(prices: pd.DataFrame) -> None:
+def _save(prices: pd.DataFrame, lag_checked: dict[str, str] | None = None) -> None:
+    """Write the frame and its meta. ``lag_checked`` replaces the stored map of
+    when each lagging ticker was last re-requested; ``None`` keeps the one on
+    disk, so a save on any other path does not reset the retry throttle."""
     CACHE_DIR.mkdir(exist_ok=True)
     prices = prices.sort_index()
+    if lag_checked is None:
+        lag_checked = (_load_meta() or {}).get("lag_checked") or {}
     atomic_write(PRICES_PARQUET, prices.to_parquet)
-    meta = json.dumps({
+    blob = {
         "start": prices.index.min().strftime("%Y-%m-%d"),
         "end": prices.index.max().strftime("%Y-%m-%d"),
         "tickers": sorted(prices.columns.tolist()),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if lag_checked:
+        blob["lag_checked"] = lag_checked
+    meta = json.dumps(blob)
     atomic_write(PRICES_META, lambda p: p.write_text(meta))
+
+
+def lagging_tickers(prices: pd.DataFrame, tickers=None,
+                    tolerance_days: int = LAG_TOLERANCE_DAYS) -> dict[str, pd.Timestamp]:
+    """``{ticker: last valid bar}`` for every column whose last bar sits more
+    than ``tolerance_days`` before the frame's last bar. A column with no bar at
+    all is not lagging: there is nothing to extend, and a fetch for its whole
+    history is the missing-ticker path's job."""
+    if prices.empty:
+        return {}
+    cols = [c for c in (prices.columns if tickers is None else tickers)
+            if c in prices.columns]
+    if not cols:
+        return {}
+    last = prices[cols].apply(lambda c: c.last_valid_index()).dropna()
+    cutoff = prices.index.max() - timedelta(days=tolerance_days)
+    return {t: pd.Timestamp(ts) for t, ts in last.items() if ts < cutoff}
 
 
 def clear() -> None:
@@ -245,6 +308,7 @@ def get_prices_cached(
         if on_status is not None:
             on_status(msg)
 
+    fetcher = _settled(fetcher)
     requested = pd.Timestamp(start), pd.Timestamp(end)
     requested_set = set(tickers)
 
@@ -289,18 +353,54 @@ def get_prices_cached(
     if requested[0] < cached_start and known_tickers:
         fetches.append((known_tickers, _d(requested[0]), _d(cached_start - timedelta(days=1))))
 
-    # 3. Range extends later, OR tail refetch window — both skipped while cache is fresh
-    if known_tickers and not cache_is_fresh:
-        if requested[1] > cached_end:
-            fetches.append((known_tickers,
-                            _d(cached_end + timedelta(days=1)), _d(requested[1])))
-        else:
-            tail_cutoff = cached_end - timedelta(days=TAIL_REFETCH_DAYS)
-            if requested[1] > tail_cutoff:
-                fetches.append((known_tickers,
-                                _d(tail_cutoff + timedelta(days=1)), _d(cached_end)))
+    # 3. Range extends later, OR tail refetch window — both skipped while cache is fresh.
+    #    Both re-pull the cached tail, so a last bar that Yahoo revised (or one
+    #    that an older version stored mid-session) is replaced.
+    tail_cutoff = cached_end - timedelta(days=TAIL_REFETCH_DAYS)
+    if known_tickers and not cache_is_fresh and requested[1] > tail_cutoff:
+        fetches.append((known_tickers, _d(tail_cutoff + timedelta(days=1)),
+                        _d(max(requested[1], cached_end))))
 
-    if not fetches:
+    # 4. Tail holes. Range-based deltas cannot see a ticker that stopped short of
+    #    the frame's end, so check the data itself. Runs even on a fresh cache,
+    #    because a fresh write is exactly how the hole gets made. Throttled per
+    #    ticker so a dead name is not re-requested on every call.
+    now = datetime.now(timezone.utc)
+    lag_checked: dict[str, str] = {}
+    for t, ts in (meta.get("lag_checked") or {}).items():
+        try:
+            if now - datetime.fromisoformat(ts) < timedelta(days=7):
+                lag_checked[t] = ts
+        except (TypeError, ValueError):
+            continue
+    lag_fetches: list[tuple[list[str], str, str]] = []
+    lag_boundaries: set = set()
+    lagging = lagging_tickers(cached, known_tickers)
+    due = {}
+    for t, last in lagging.items():
+        checked = lag_checked.get(t)
+        if checked and now - datetime.fromisoformat(checked) < timedelta(hours=LAG_RETRY_HOURS):
+            continue
+        due[t] = last
+    if due:
+        lag_end = _d(max(requested[1], cached_end) + timedelta(days=1))
+        by_start: dict[pd.Timestamp, list[str]] = {}
+        for t, last in due.items():
+            by_start.setdefault(last, []).append(t)
+        for last, group in sorted(by_start.items()):
+            lag_fetches.append((sorted(group), _d(last + timedelta(days=1)), lag_end))
+            lag_boundaries.add(last)
+        stamp = now.isoformat()
+        for t in due:
+            lag_checked[t] = stamp
+        held_back = len(lagging) - len(due)
+        status(f"{len(due)} ticker(s) stop before the cache end ({_d(cached_end)}); "
+               f"filling the gap" + (f", {held_back} retried recently" if held_back else ""))
+    elif lagging:
+        status(f"{len(lagging)} ticker(s) stop before the cache end ({_d(cached_end)}); "
+               f"retried within the last {LAG_RETRY_HOURS}h, so not fetched now")
+
+    if not fetches and not lag_fetches:
         status("Cache hit — skipped download")
         return _slice(cached, *requested, tickers)
 
@@ -309,26 +409,43 @@ def get_prices_cached(
         status(f"Fetching {len(f_tickers)} ticker(s), {f_start} to {f_end}")
         delta = fetcher(f_tickers, f_start, f_end)
         merged = _merge(merged, delta)
+    for f_tickers, f_start, f_end in lag_fetches:
+        status(f"Fetching {len(f_tickers)} lagging ticker(s), {f_start} to {f_end}")
+        # Best-effort, unlike the range deltas above: the cache already answers
+        # the request, so a failure here keeps it and waits for the next window.
+        try:
+            delta = fetcher(f_tickers, f_start, f_end)
+        except Exception as exc:
+            status(f"Gap fill failed ({exc}); serving the cache with the gap")
+            continue
+        merged = _merge(merged, delta)
+    still = lagging_tickers(merged, sorted(due))
+    if due:
+        status(f"Gap fill: {len(due) - len(still)} of {len(due)} ticker(s) now reach "
+               f"the cache end" + (f"; still short: {', '.join(sorted(still)[:6])}"
+                                   + ("…" if len(still) > 6 else "") if still else ""))
 
     # Only known tickers (present in both the old cache and this run) can carry a
     # stitch across their old/new adjustment basis; a split in the fetched gap
     # shows up as a jump at the seam between cached and freshly-pulled data.
     # Boundary = last old-basis date on one side, first fresh-basis date on the
     # other. Extend-earlier prepends fresh bars *before* cached_start, so its
-    # seam sits just below cached_start; extend-later / tail append fresh bars
-    # after an old-basis date.
+    # seam sits just below cached_start; extend-later / tail replace everything
+    # after tail_cutoff.
     boundaries = set()
     if requested[0] < cached_start:
         boundaries.add(cached_start - timedelta(days=1))
     if not cache_is_fresh:
-        boundaries.add(cached_end if requested[1] > cached_end
-                       else cached_end - timedelta(days=TAIL_REFETCH_DAYS))
+        boundaries.add(tail_cutoff)
+    # A gap fill appends fresh-basis bars after each lagging ticker's last
+    # old-basis bar, so that bar is a seam too.
+    boundaries |= lag_boundaries
     merged = _heal_split_artifacts(
         merged, sorted(requested_set & cached_tickers), fetcher, status,
         boundaries=boundaries,
     )
 
-    _save(merged)
+    _save(merged, lag_checked=lag_checked)
     return _slice(merged, *requested, tickers)
 
 
@@ -444,6 +561,6 @@ def repair(
     flagged = _detect_split_artifacts(merged, list(merged.columns))
     if not flagged:
         return []
-    merged = _heal_split_artifacts(merged, flagged, fetcher, status)
+    merged = _heal_split_artifacts(merged, flagged, _settled(fetcher), status)
     _save(merged)
     return flagged
