@@ -419,6 +419,8 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                             universe={params.universe || 'sp500'}
                             cacheInfo={cacheInfo} universes={universes} />
 
+        <LedgerNudge theme={v2Theme} reloadKey={recorder.ledgerVersion} />
+
         {!ready ? (
           <V2EmptyState onRun={onRun} running={running} error={error}
                         elapsed={elapsed} status={status} />
@@ -823,7 +825,8 @@ function V2Dashboard({ params, ranParams, setParam, data, status, running, error
                           onRecord={recorder.onRecord}
                           recordState={recorder.recordState}
                           recordMessage={recorder.recordMessage}
-                          recordedAsOf={recorder.recordedAsOf} />
+                          recordedAsOf={recorder.recordedAsOf}
+                          recordGap={recorder.gapPrompt} />
 
           {/* Realized out-of-sample record of the targets recorded above */}
           <LedgerPanel theme={v2Theme} accent={v2Accent}

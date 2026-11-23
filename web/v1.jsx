@@ -386,6 +386,8 @@ function V1Dashboard({ params, ranParams, setParam, data, status, running, error
         <TopPerformersPanel theme={v1Theme} accent={v1Accent}
                             cacheInfo={cacheInfo} universes={universes} />
 
+        <LedgerNudge theme={v1Theme} reloadKey={recorder.ledgerVersion} />
+
         {!ready ? (
           <V1EmptyState onRun={onRun} running={running} error={error}
                         elapsed={elapsed} status={status} />
@@ -725,7 +727,8 @@ function V1Dashboard({ params, ranParams, setParam, data, status, running, error
                           onRecord={recorder.onRecord}
                           recordState={recorder.recordState}
                           recordMessage={recorder.recordMessage}
-                          recordedAsOf={recorder.recordedAsOf} />
+                          recordedAsOf={recorder.recordedAsOf}
+                          recordGap={recorder.gapPrompt} />
 
           {/* Realized out-of-sample record of the targets recorded above */}
           <LedgerPanel theme={v1Theme} accent={v1Accent}

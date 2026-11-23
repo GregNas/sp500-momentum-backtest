@@ -10,7 +10,7 @@ import json
 import re
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
@@ -75,6 +75,11 @@ class LedgerRecordParams(BaseModel):
     # stale tab can be told it recorded a different day than it displayed. The
     # cohort itself is never taken from the client.
     displayedAsOf: Optional[str] = None
+    # What to do when earlier month-ends have no entry. None asks: nothing is
+    # written and the response lists the months. "leave" records with the gap.
+    # "backfill" first fills the months with reconstructed targets. With no gap
+    # all 3 behave the same.
+    gapPolicy: Optional[Literal["backfill", "leave"]] = None
     runId: Optional[str] = None
 
 
@@ -916,6 +921,80 @@ def _record_universe(key: str, benchmark: str) -> Tuple[List[str], str]:
     )
 
 
+def _today() -> date:
+    """The server date. A seam, so tests can pin the calendar."""
+    return datetime.today().date()
+
+
+def _entries_for_hash(p_hash: str) -> List[dict]:
+    """Recorded entries of one settings group whose as_of parses as a date."""
+    out = []
+    for e in ledger.load():
+        if e.get("params_hash") != p_hash:
+            continue
+        try:
+            pd.Timestamp(e.get("as_of"))
+        except Exception:
+            continue
+        if e.get("as_of"):
+            out.append(e)
+    return out
+
+
+def _ledger_entry(target: dict, constituents: pd.DataFrame, frame: pd.DataFrame,
+                  benchmark: str, entry_params: dict, universe_source: str,
+                  note: Optional[str], extra: Optional[dict] = None) -> dict:
+    """A ledger entry for ``target``, priced at the target's own as_of bar."""
+    as_of_ts = pd.Timestamp(target["as_of"])
+    entry_prices: dict[str, float | None] = {}
+    entry_unpriced: list[str] = []
+    at_as_of = (constituents.loc[as_of_ts]
+                if as_of_ts in constituents.index else None)
+    for t in target["tickers"]:
+        v = None if at_as_of is None else at_as_of.get(t)
+        # None, never NaN: a NaN here would 500 the response, and copying the
+        # signal_end price would pass off an older bar as the as_of price.
+        price = None if v is None or pd.isna(v) else float(v)
+        entry_prices[t] = price
+        if price is None:
+            entry_unpriced.append(t)
+
+    # The benchmark column can lag the constituents (a NaN on the as_of bar is
+    # normal), and scoring is locked to the benchmark recorded here, so taking
+    # only the as_of bar would leave the entry permanently unscoreable. Fall back
+    # to the benchmark's own last valid close at or before as_of and record which
+    # date it came from, rather than silently passing it off as the as_of price.
+    bench_price = None
+    bench_price_date = None
+    if benchmark in frame.columns:
+        bench_col = frame[benchmark].loc[:as_of_ts].dropna()
+        if len(bench_col):
+            bench_price = float(bench_col.iloc[-1])
+            bench_price_date = bench_col.index[-1].strftime("%Y-%m-%d")
+
+    entry = {
+        "params_hash": ledger.params_hash(entry_params),
+        "signal_version": ledger.SIGNAL_VERSION,
+        "params": entry_params,
+        "benchmark": benchmark,
+        "as_of": target["as_of"],
+        "signal_end": target["signal_end"],
+        "window_start": target["start_date"],
+        "days": target["days"],
+        "recorded_at": (datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds").replace("+00:00", "Z")),
+        "tickers": target["tickers"],
+        "entry_prices": entry_prices,
+        "entry_unpriced": entry_unpriced,
+        "benchmark_entry_price": bench_price,
+        "benchmark_entry_date": bench_price_date,
+        "universe_source": universe_source,
+        "note": note,
+    }
+    entry.update(extra or {})
+    return entry
+
+
 def _ledger_label(entry: dict) -> str:
     p = entry.get("params") or {}
     parts = [
@@ -969,6 +1048,28 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
             ),
         )
 
+    entry_params = {
+        "universe": params.universe,
+        "topN": params.topN,
+        "rankLookback": params.rankLookback,
+        "skipMonths": params.skipMonths,
+    }
+    recorded = _entries_for_hash(ledger.params_hash(entry_params))
+    newest_as_of = max((e["as_of"] for e in recorded), default=None)
+
+    # A backfill ranks each missed month on the window that ends at that month,
+    # so a refresh must reach back past the oldest month it may fill, not just
+    # past today's window.
+    fetch_days = LEDGER_FETCH_DAYS
+    if newest_as_of and params.gapPolicy != "leave":
+        pending = analysis.ledger_missed_months(
+            newest_as_of, _today().isoformat())[-analysis.LEDGER_BACKFILL_MAX_MONTHS:]
+        if pending:
+            first = pd.Period(pending[0], "M").start_time
+            reach = ((pd.Timestamp(_today()) - first).days + 10
+                     + analysis.signal_window_days(params.rankLookback, params.skipMonths))
+            fetch_days = max(fetch_days, int(reach))
+
     # Dedupe: a benchmark that is itself a universe member (SPY under a custom or
     # ETF universe) would otherwise appear twice, and a duplicated label makes
     # frame[col] return a DataFrame instead of a Series, which raises deep inside
@@ -979,10 +1080,14 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
     stale = True
     if frame is not None and not frame.empty:
         age = (pd.Timestamp(datetime.today().date()) - frame.index.max()).days
-        stale = age > LEDGER_CACHE_STALE_DAYS
+        # The frame's last bar can come from a few tickers only, so also check
+        # whether the universe itself reaches it. get_prices fills such a gap.
+        lagging = cache.lagging_tickers(
+            frame, [t for t in universe_tickers if t != params.benchmark])
+        stale = age > LEDGER_CACHE_STALE_DAYS or bool(lagging)
     if frame is None or frame.empty or stale:
         end = datetime.today()
-        start = end - timedelta(days=LEDGER_FETCH_DAYS)
+        start = end - timedelta(days=fetch_days)
         try:
             frame = data.get_prices(wanted, start.strftime("%Y-%m-%d"),
                                     end.strftime("%Y-%m-%d"), on_status=on_status)
@@ -1040,61 +1145,81 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
                     f"Run a backtest first."),
         )
 
-    as_of_ts = pd.Timestamp(target["as_of"])
-    entry_prices: dict[str, float | None] = {}
-    entry_unpriced: list[str] = []
-    at_as_of = (constituents.loc[as_of_ts]
-                if as_of_ts in constituents.index else None)
-    for t in target["tickers"]:
-        v = None if at_as_of is None else at_as_of.get(t)
-        # None, never NaN: a NaN here would 500 the response, and copying the
-        # signal_end price would pass off an older bar as the as_of price.
-        price = None if v is None or pd.isna(v) else float(v)
-        entry_prices[t] = price
-        if price is None:
-            entry_unpriced.append(t)
+    # ---- missed month-ends ----
+    # Measured against the target's own bar, not the wall clock: a month is only
+    # "missed" once the price frame has moved past it.
+    missed = (analysis.ledger_missed_months(newest_as_of, target["as_of"])
+              if newest_as_of else [])
+    backfill_entries: list[dict] = []
+    if missed and params.gapPolicy != "leave":
+        fillable = missed[-analysis.LEDGER_BACKFILL_MAX_MONTHS:]
+        beyond_cap = missed[:len(missed) - len(fillable)]
+        if any(not e.get("reconstructed") for e in recorded):
+            recon = analysis.reconstruct_targets(
+                constituents, fillable, top_n=params.topN,
+                rank_lookback=params.rankLookback, skip_months=params.skipMonths)
+        else:
+            recon = [{"month": m, "as_of": None, "target": None,
+                      "refused_reason": "no live entry exists for these settings"}
+                     for m in fillable]
 
-    # The benchmark column can lag the constituents (a NaN on the as_of bar is
-    # normal), and scoring is locked to the benchmark recorded here, so taking
-    # only the as_of bar would leave the entry permanently unscoreable. Fall back
-    # to the benchmark's own last valid close at or before as_of and record which
-    # date it came from, rather than silently passing it off as the as_of price.
-    bench_price = None
-    bench_price_date = None
-    if params.benchmark in frame.columns:
-        bench_col = frame[params.benchmark].loc[:as_of_ts].dropna()
-        if len(bench_col):
-            bench_price = float(bench_col.iloc[-1])
-            bench_price_date = bench_col.index[-1].strftime("%Y-%m-%d")
+        if params.gapPolicy is None:
+            return _assert_json_clean({
+                "created": False,
+                "entry": None,
+                "reason": "gap",
+                "as_of": target["as_of"],
+                "newest_as_of": newest_as_of,
+                "missed": missed,
+                "beyond_cap": beyond_cap,
+                "reconstructable": [
+                    {"month": r["month"], "as_of": r["as_of"],
+                     "ok": r["target"] is not None, "reason": r["refused_reason"]}
+                    for r in recon],
+                "target_matches_stored": True,
+                "displayed_as_of_matches":
+                    params.displayedAsOf is None or params.displayedAsOf == target["as_of"],
+                "universe_source": universe_source,
+                "price_source": price_source,
+                "warnings": warnings,
+                "status_messages": status_messages,
+            }, "ledger record")
 
-    entry_params = {
-        "universe": params.universe,
-        "topN": params.topN,
-        "rankLookback": params.rankLookback,
-        "skipMonths": params.skipMonths,
-    }
-    entry = {
-        "params_hash": ledger.params_hash(entry_params),
-        "signal_version": ledger.SIGNAL_VERSION,
-        "params": entry_params,
-        "benchmark": params.benchmark,
-        "as_of": target["as_of"],
-        "signal_end": target["signal_end"],
-        "window_start": target["start_date"],
-        "days": target["days"],
-        "recorded_at": (datetime.now(timezone.utc)
-                        .isoformat(timespec="milliseconds").replace("+00:00", "Z")),
-        "tickers": target["tickers"],
-        "entry_prices": entry_prices,
-        "entry_unpriced": entry_unpriced,
-        "benchmark_entry_price": bench_price,
-        "benchmark_entry_date": bench_price_date,
-        "universe_source": universe_source,
-        "note": params.note,
-    }
+        usable = [r for r in recon if r["target"] is not None]
+        if not usable:
+            reasons = "; ".join(f"{r['month']}: {r['refused_reason']}" for r in recon)
+            raise HTTPException(
+                status_code=409,
+                detail=(f"None of the missed months can be reconstructed ({reasons}). "
+                        f"Nothing was written. Record with the gap instead."),
+            )
+        for r in recon:
+            if r["target"] is None:
+                warnings.append(f"{r['month']} was not reconstructed: {r['refused_reason']}.")
+        if beyond_cap:
+            warnings.append(
+                f"{len(beyond_cap)} older month(s) are past the "
+                f"{analysis.LEDGER_BACKFILL_MAX_MONTHS}-month backfill limit and stay as a gap.")
+        stamp = (datetime.now(timezone.utc)
+                 .isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+        backfill_entries = [
+            _ledger_entry(r["target"], constituents, frame, params.benchmark,
+                          entry_params, universe_source, note=None,
+                          extra={"reconstructed": True, "reconstructed_at": stamp,
+                                 "universe_as_of": _today().isoformat()})
+            for r in usable]
+
+    entry = _ledger_entry(target, constituents, frame, params.benchmark,
+                          entry_params, universe_source, note=params.note)
 
     try:
-        stored, created = ledger.append(entry)
+        if backfill_entries:
+            # One write for the whole set: a half-filled gap is worse than either
+            # outcome.
+            ledger.append_many(backfill_entries + [entry])
+            stored, created = entry, True
+        else:
+            stored, created = ledger.append(entry)
     except ledger.LedgerConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except OSError as exc:
@@ -1123,6 +1248,8 @@ def _record_ledger_target(params: LedgerRecordParams) -> dict:
         "price_source": price_source,
         "warnings": warnings,
         "status_messages": status_messages,
+        **({"backfilled": [e["as_of"] for e in backfill_entries]}
+           if backfill_entries else {}),
     }, "ledger record")
 
 
@@ -1217,6 +1344,10 @@ def ledger_history(
                 f"{bench} (each row reports its own)."
             )
         marks = analysis.ledger_marks(ordered, prices, benchmark=bench)
+        # The reminder runs on the server date, not the price frame: stale prices
+        # are exactly the state it has to report.
+        gap = analysis.ledger_gap(newest["as_of"], _today().isoformat())
+        gap["prices_through"] = marks["summary"]["priced_through"]
         for row in marks["rows"]:
             for t in row["frozen_tickers"]:
                 key = (t, row["frozen_at"].get(t))
@@ -1233,6 +1364,7 @@ def ledger_history(
             "benchmark": bench,
             "universe_sources": sorted({e.get("universe_source") for e in ordered
                                         if e.get("universe_source")}),
+            "gap": gap,
             **marks,
         })
 

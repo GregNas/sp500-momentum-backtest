@@ -812,13 +812,95 @@ def _recorded_price(entry: dict, ticker: str) -> float | None:
     return v if v is not None and v > 0 else None
 
 
+LEDGER_BACKFILL_MAX_MONTHS = 12
+
+
+def ledger_missed_months(newest_as_of: str, upto: str) -> list[str]:
+    """``YYYY-MM`` labels of the calendar months strictly between two dates.
+
+    A record in consecutive months gives ``[]``, so a normal monthly cadence
+    never reports a gap.
+    """
+    first = pd.Period(pd.Timestamp(newest_as_of), "M") + 1
+    last = pd.Period(pd.Timestamp(upto), "M") - 1
+    if last < first:
+        return []
+    return [str(p) for p in pd.period_range(first, last, freq="M")]
+
+
+def ledger_gap(newest_as_of: str, today: str) -> dict:
+    """Where a record group stands against the calendar.
+
+    ``current``: the newest entry is in today's month. ``due``: it is in the
+    month before. ``missed``: at least one whole month has no entry.
+    """
+    missed = ledger_missed_months(newest_as_of, today)
+    same_month = (pd.Period(pd.Timestamp(newest_as_of), "M")
+                  >= pd.Period(pd.Timestamp(today), "M"))
+    state = "current" if same_month else ("missed" if missed else "due")
+    return {"newest_as_of": newest_as_of, "state": state, "missed_months": missed}
+
+
+def reconstruct_targets(
+    prices: pd.DataFrame,
+    months: list[str],
+    top_n: int,
+    rank_lookback: int,
+    skip_months: int = 0,
+) -> list[dict]:
+    """The target :func:`current_target` gives at each past month-end.
+
+    Each month is ranked on the frame cut at that month's last bar, so no later
+    bar can reach the ranking and no ranking code is added. A month is refused,
+    never guessed, when the frame cannot prove the month-end or cannot cover the
+    ranking window. Returns one ``{month, as_of, target, refused_reason}`` per
+    label, in the order given.
+    """
+    idx = prices.index
+    need_days = signal_window_days(rank_lookback, skip_months)
+    out: list[dict] = []
+    for label in months:
+        period = pd.Period(label, "M")
+        item = {"month": label, "as_of": None, "target": None, "refused_reason": None}
+        out.append(item)
+        in_month = idx[(idx >= period.start_time) & (idx <= period.end_time)]
+        if not len(in_month):
+            item["refused_reason"] = "no price bars in that month"
+            continue
+        bar = in_month[-1]
+        item["as_of"] = bar.strftime("%Y-%m-%d")
+        # Without a later bar the frame may simply stop mid-month, and its last
+        # bar would be passed off as the month-end.
+        if not (idx > period.end_time).any():
+            item["refused_reason"] = "no price bar after that month to confirm its last bar"
+            continue
+        span = int((bar - idx.min()).days)
+        if span < need_days:
+            item["refused_reason"] = (
+                f"prices cover {span} days before that month-end, the signal needs {need_days}")
+            continue
+        target = current_target(prices.loc[:bar], top_n=top_n,
+                                rank_lookback=rank_lookback, skip_months=skip_months)
+        if target is None:
+            item["refused_reason"] = "not enough price history to form a target"
+            continue
+        if len(target["tickers"]) < top_n:
+            item["refused_reason"] = (
+                f"only {len(target['tickers'])} of {top_n} names have prices in the window")
+            continue
+        item["target"] = target
+    return out
+
+
 def _empty_ledger_marks(reason: str) -> dict:
     return {
         "rows": [],
-        "equity": {"dates": [], "strategy": [], "benchmark": []},
+        "equity": {"dates": [], "strategy": [], "benchmark": [],
+                   "reconstructed_ranges": []},
         "summary": {
             "first_as_of": None, "priced_through": None,
             "n_segments": 0, "n_completed": 0, "days_live": 0,
+            "n_reconstructed": 0, "live_only": None,
             "total_return": None, "benchmark_total_return": None, "excess": None,
             "equity_starts_at": None, "equity_segments": 0,
             "equity_covers_all_segments": False,
@@ -955,6 +1037,8 @@ def _mark_segment(entry: dict, s_ts, end_ts, frame: pd.DataFrame,
         "basis_unverified_tickers": unverified,
         "days_held": days_held,
         "note": entry.get("note"),
+        "reconstructed": bool(entry.get("reconstructed")),
+        "universe_as_of": entry.get("universe_as_of"),
     }
 
 
@@ -1121,12 +1205,45 @@ def ledger_marks(
             "Sharpe": _jsonf(stats["Sharpe"]),
         }
 
+    # A reconstructed month was recomputed after the fact, so the total that
+    # includes it is published beside the total over live entries alone (where
+    # the last live cohort is held through the gap). Showing both removes the
+    # choice of whichever record looks better.
+    n_reconstructed = sum(1 for r in rows if r["reconstructed"])
+    live_only = None
+    if n_reconstructed:
+        live = [e for e in ordered if not e.get("reconstructed")]
+        if live:
+            ls = ledger_marks(live, prices, benchmark=benchmark,
+                              risk_free_annual=risk_free_annual)["summary"]
+            live_only = {
+                "total_return": ls["total_return"],
+                "benchmark_total_return": ls["benchmark_total_return"],
+                "excess": ls["excess"],
+                "n_segments": ls["n_segments"],
+            }
+
+    recon_ranges: list[list[str]] = []
+    if dates:
+        for k, e in enumerate(ordered):
+            # Only the part of a reconstructed segment the curve actually drew.
+            if (not e.get("reconstructed") or starts[k] is None or ends[k] is None
+                    or starts[k] < dates[0] or starts[k] >= dates[-1]):
+                continue
+            pair = [starts[k].strftime("%Y-%m-%d"),
+                    min(ends[k], dates[-1]).strftime("%Y-%m-%d")]
+            if recon_ranges and recon_ranges[-1][1] == pair[0]:
+                recon_ranges[-1][1] = pair[1]
+            else:
+                recon_ranges.append(pair)
+
     return {
         "rows": rows[::-1],                       # newest first for the UI
         "equity": {
             "dates": [d.strftime("%Y-%m-%d") for d in dates],
             "strategy": vals,
             "benchmark": bench_vals,
+            "reconstructed_ranges": recon_ranges,
         },
         "summary": {
             "first_as_of": first_as_of,
@@ -1135,6 +1252,8 @@ def ledger_marks(
             "n_segments": m,
             "n_completed": n_completed,
             "days_live": days_live,
+            "n_reconstructed": n_reconstructed,
+            "live_only": live_only,
             # total_return and benchmark_total_return chain the same segments, so
             # excess is a real difference. total_return_all_segments compounds
             # every priced segment including those the benchmark could not mark,

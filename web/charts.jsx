@@ -22,7 +22,8 @@ function useViewport() {
 // EquityCurveChart — log-scale line chart of strategies vs benchmark
 // ============================================================
 function EquityCurveChart({
-  series,            // { name, values, color, dashed?, isBenchmark? }[]
+  series,            // { name, values, color, dashed?, isBenchmark?, dashedRanges? }[]
+                     // dashedRanges: [fromIdx, toIdx][] drawn dashed on a solid line
   months,            // Date[]
   height = 320,
   logScale = true,
@@ -138,13 +139,35 @@ function EquityCurveChart({
 
       {/* Lines */}
       {series.map((s, k) => {
-        const path = s.values.map((v, i) => `${i === 0 ? 'M' : 'L'}${xAt(i)},${yAt(v)}`).join(' ');
-        return (
-          <path key={k} d={path} fill="none"
-                stroke={s.color} strokeWidth={s.isBenchmark ? 1.5 : 2}
-                strokeDasharray={s.dashed ? '4 4' : 'none'}
-                strokeLinejoin="round" strokeLinecap="round" />
-        );
+        const ranges = s.dashedRanges || [];
+        if (!ranges.length) {
+          const path = s.values.map((v, i) => `${i === 0 ? 'M' : 'L'}${xAt(i)},${yAt(v)}`).join(' ');
+          return (
+            <path key={k} d={path} fill="none"
+                  stroke={s.color} strokeWidth={s.isBenchmark ? 1.5 : 2}
+                  strokeDasharray={s.dashed ? '4 4' : 'none'}
+                  strokeLinejoin="round" strokeLinecap="round" />
+          );
+        }
+        // Split the line into runs of edges that share a style. Edge i joins
+        // point i to point i + 1.
+        const runs = [];
+        for (let i = 0; i < s.values.length - 1; i++) {
+          const dashed = ranges.some(([a, b]) => i >= a && i < b);
+          const last = runs[runs.length - 1];
+          if (last && last.dashed === dashed) last.end = i + 1;
+          else runs.push({ dashed, start: i, end: i + 1 });
+        }
+        return runs.map((run, j) => {
+          const d = s.values.slice(run.start, run.end + 1)
+            .map((v, n) => `${n === 0 ? 'M' : 'L'}${xAt(run.start + n)},${yAt(v)}`).join(' ');
+          return (
+            <path key={`${k}-${j}`} d={d} fill="none"
+                  stroke={s.color} strokeWidth={s.isBenchmark ? 1.5 : 2}
+                  strokeDasharray={run.dashed ? '6 5' : 'none'}
+                  strokeLinejoin="round" strokeLinecap="round" />
+          );
+        });
       })}
 
       {/* Hover crosshair */}
@@ -1080,7 +1103,8 @@ function RebalanceHistoryRow({ r, theme }) {
 function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, universe = 'sp500',
                           regime = null, benchmark = 'SPY',
                           theme, accent, headingFont,
-                          onRecord, recordState = 'idle', recordMessage, recordedAsOf }) {
+                          onRecord, recordState = 'idle', recordMessage, recordedAsOf,
+                          recordGap }) {
   // Earnings dates the server had cached arrive with the backtest; anything it
   // did not are fetched here, after render, so a cold lookup never delays the
   // dashboard. Keyed by the row so a new run discards the previous answers.
@@ -1180,7 +1204,56 @@ function RebalancePanel({ rebalance, topN, rankLookback, skipMonths = 0, univers
                   {recordMessage}
                 </span>
               )}
-              {!recordMessage && recordedAsOf && (
+              {recordGap && (() => {
+                const items = recordGap.reconstructable || [];
+                const bad = items.filter(x => !x.ok);
+                const canFill = items.some(x => x.ok);
+                const busy = recordState === 'saving';
+                const btn = (primary) => ({
+                  padding: '5px 9px', fontSize: 10.5, fontWeight: 600,
+                  borderRadius: 4, whiteSpace: 'nowrap',
+                  background: primary ? '#92400e' : '#fff',
+                  color: primary ? '#fff' : '#92400e',
+                  border: '1px solid #92400e',
+                });
+                return (
+                  <div role="alert" style={{
+                    fontSize: 10.5, lineHeight: 1.5, textAlign: 'right', color: '#78350f',
+                    background: '#fffbeb', border: '1px solid #fcd34d',
+                    borderRadius: 4, padding: '7px 9px',
+                  }}>
+                    <div>
+                      <strong>Nothing recorded yet.</strong>{' '}
+                      {recordGap.missed.length} month-end{recordGap.missed.length === 1 ? '' : 's'}{' '}
+                      since {recordGap.newest_as_of} {recordGap.missed.length === 1 ? 'has' : 'have'} no
+                      entry: {recordGap.missed.join(', ')}.
+                    </div>
+                    {bad.length > 0 && (
+                      <div>Cannot be reconstructed: {bad.map(x => `${x.month} (${x.reason})`).join('; ')}.</div>
+                    )}
+                    {(recordGap.beyond_cap || []).length > 0 && (
+                      <div>{recordGap.beyond_cap.length} older month(s) are past the backfill limit.</div>
+                    )}
+                    <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end',
+                                   flexWrap: 'wrap', marginTop: 6 }}>
+                      <button onClick={() => onRecord('backfill')} disabled={busy || !canFill}
+                              title={'Recompute the target at each missed month-end from the prices on disk, '
+                                   + 'label those entries reconstructed, then record today\'s target'}
+                              style={{ ...btn(true), opacity: (busy || !canFill) ? 0.5 : 1,
+                                       cursor: (busy || !canFill) ? 'not-allowed' : 'pointer' }}>
+                        Backfill, then record
+                      </button>
+                      <button onClick={() => onRecord('leave')} disabled={busy}
+                              title={'Record today\'s target only. The last recorded picks are then scored '
+                                   + 'as held through the gap, and the gap can no longer be filled.'}
+                              style={{ ...btn(false), cursor: busy ? 'wait' : 'pointer' }}>
+                        Record with the gap
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+              {!recordMessage && !recordGap && recordedAsOf && (
                 <span style={{ fontSize: 10, color: theme.muted,
                                 fontFamily: 'JetBrains Mono, monospace' }}>
                   ledger holds {recordedAsOf}
@@ -1632,6 +1705,15 @@ function isoToLocalDate(iso) {
 // re-adjustment alone never reaches the threshold.
 function ledgerChips(r) {
   const out = [];
+  if (r.reconstructed) {
+    out.push({
+      label: 'reconstructed', color: '#6d28d9', bg: '#f5f3ff',
+      title: `Not recorded on the day. Recomputed later from prices up to ${r.as_of}, `
+           + `with the member list as read on ${r.universe_as_of || 'the backfill date'}. `
+           + `A name that joined the index after ${r.as_of} can appear here, and the `
+           + `prices were re-adjusted since.`,
+    });
+  }
   if (r.n_frozen > 0) {
     const at = Object.entries(r.frozen_at || {})
       .map(([t, d]) => `${t} to ${d}`).join(', ');
@@ -1821,16 +1903,23 @@ function useLedgerRecorder(ranParams, rebalance) {
   // or topN, where it would claim a cohort that group never recorded.
   const [recorded, setRecorded] = useState(null);
   const setRecordedAsOf = (asOf) => setRecorded({ asOf, key: recordKey(ranParams) });
+  // The server's answer when earlier month-ends have no entry. Nothing is
+  // written until the user picks a policy.
+  const [gapPrompt, setGapPrompt] = useState(null);
 
   const latest = rebalance && rebalance.length ? rebalance[0] : null;
   const recordedAsOf = (recorded && recorded.key === recordKey(ranParams))
     ? recorded.asOf : null;
 
   // A new run invalidates the previous outcome message.
-  useEffect(() => { setRecordState('idle'); setRecordMessage(null); }, [rebalance]);
+  useEffect(() => {
+    setRecordState('idle'); setRecordMessage(null); setGapPrompt(null);
+  }, [rebalance]);
 
-  const onRecord = async () => {
+  // Also wired straight to onClick, so the argument can be a click event.
+  const onRecord = async (policy) => {
     if (!ranParams || !latest || !latest.is_live || recordState === 'saving') return;
+    const gapPolicy = (policy === 'backfill' || policy === 'leave') ? policy : null;
     setRecordState('saving');
     setRecordMessage(null);
     try {
@@ -1841,7 +1930,14 @@ function useLedgerRecorder(ranParams, rebalance) {
         skipMonths: ranParams.skipMonths || 0,
         benchmark: ranParams.benchmark || 'SPY',
         displayedAsOf: latest.as_of || null,
+        gapPolicy,
       });
+      if (res.reason === 'gap') {
+        setGapPrompt(res);
+        setRecordState('idle');
+        return;
+      }
+      setGapPrompt(null);
       setRecordedAsOf(res.as_of);
       setLedgerVersion(v => v + 1);
       const notes = [];
@@ -1856,7 +1952,10 @@ function useLedgerRecorder(ranParams, rebalance) {
       const tail = notes.length ? ` — ${notes.join('; ')}` : '';
       if (res.created) {
         setRecordState('saved');
-        setRecordMessage(`Recorded for ${res.as_of}${tail}`);
+        const filled = (res.backfilled || []).length;
+        setRecordMessage(`Recorded for ${res.as_of}`
+          + (filled ? `, after ${filled} reconstructed month-end${filled === 1 ? '' : 's'}` : '')
+          + tail);
       } else {
         setRecordState('exists');
         setRecordMessage(res.reason === 'already_recorded_this_month'
@@ -1869,7 +1968,49 @@ function useLedgerRecorder(ranParams, rebalance) {
     }
   };
 
-  return { onRecord, recordState, recordMessage, recordedAsOf, ledgerVersion };
+  return { onRecord, recordState, recordMessage, recordedAsOf, ledgerVersion, gapPrompt };
+}
+
+// One line that says a target is due or month-ends were missed. It reads the
+// ledger from disk on page open, so it works before any backtest run and with
+// no network. It follows the most recently recorded settings group: that is the
+// record in use, and an abandoned experiment must not nag forever.
+function LedgerNudge({ theme, reloadKey }) {
+  const [gap, setGap] = useState(null);
+
+  useEffect(() => {
+    let stale = false;
+    fetchLedger({}).then(d => {
+      if (stale) return;
+      const g = ((d && d.groups) || [])
+        .filter(x => x.gap && x.gap.newest_as_of)
+        .sort((a, b) => b.gap.newest_as_of.localeCompare(a.gap.newest_as_of))[0];
+      setGap(g ? { ...g.gap, label: g.label } : null);
+    }).catch(() => { if (!stale) setGap(null); });
+    return () => { stale = true; };
+  }, [reloadKey]);
+
+  if (!gap || gap.state === 'current') return null;
+  const missed = gap.state === 'missed';
+  const n = (gap.missed_months || []).length;
+  return (
+    <div role="status" style={{
+      fontSize: 11.5, lineHeight: 1.5, padding: '8px 12px', borderRadius: 5,
+      color: missed ? '#78350f' : theme.muted,
+      background: missed ? '#fffbeb' : 'transparent',
+      border: `1px solid ${missed ? '#fcd34d' : theme.border}`,
+    }}>
+      <strong>Out-of-sample ledger:</strong>{' '}
+      {missed
+        ? `${n} month-end${n === 1 ? ' has' : 's have'} no record (${gap.missed_months.join(', ')}). `
+        : 'no target is recorded for this month yet. '}
+      Last record {gap.newest_as_of} ({gap.label}).
+      {gap.prices_through ? ` Prices on disk end ${gap.prices_through}.` : ''}
+      {missed
+        ? ' Run the backtest, then click Record this target to fill the gap or keep it.'
+        : ' Run the backtest, then click Record this target.'}
+    </div>
+  );
 }
 
 function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
@@ -1907,10 +2048,15 @@ function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
   const dates = group ? (group.equity.dates || []) : [];
   const months = useMemo(() => dates.map(isoToLocalDate), [group, dates.length]);
 
+  // Date pairs from the server, turned into point indexes for the chart.
+  const reconRanges = (group ? (group.equity.reconstructed_ranges || []) : [])
+    .map(([a, b]) => [dates.indexOf(a), dates.indexOf(b)])
+    .filter(([a, b]) => a >= 0 && b > a);
+
   const series = [];
   if (group && dates.length > 1) {
     series.push({ name: 'Recorded targets', values: group.equity.strategy,
-                  color: accent.dark });
+                  color: accent.dark, dashedRanges: reconRanges });
     if ((group.equity.benchmark || []).length === dates.length) {
       series.push({ name: group.benchmark || benchmark || 'benchmark',
                     values: group.equity.benchmark,
@@ -2022,9 +2168,17 @@ function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
                          paddingBottom: 12, borderBottom: `1px solid ${theme.border}` }}>
             {tile('Recorded targets',
                   s.total_return == null ? '—' : fmtPct(s.total_return, 1),
-                  `${s.n_segments} segment${s.n_segments === 1 ? '' : 's'} · ${s.n_completed} completed`,
+                  `${s.n_segments} segment${s.n_segments === 1 ? '' : 's'} · ${s.n_completed} completed`
+                    + (s.n_reconstructed ? ` · ${s.n_reconstructed} reconstructed` : ''),
                   s.total_return == null ? theme.muted
                     : (s.total_return >= 0 ? '#047857' : '#b91c1c'))}
+            {s.live_only && tile('Live entries only',
+                  s.live_only.total_return == null ? '—' : fmtPct(s.live_only.total_return, 1),
+                  `${s.live_only.n_segments} segment${s.live_only.n_segments === 1 ? '' : 's'}`
+                    + (s.live_only.excess == null ? ''
+                       : ` · excess ${(s.live_only.excess * 100).toFixed(1)}pp`),
+                  s.live_only.total_return == null ? theme.muted
+                    : (s.live_only.total_return >= 0 ? '#047857' : '#b91c1c'))}
             {tile(group.benchmark || 'Benchmark',
                   s.benchmark_total_return == null ? '—' : fmtPct(s.benchmark_total_return, 1),
                   s.comparison_covers_all_segments === false
@@ -2044,6 +2198,21 @@ function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
                      `CAGR ${fmtPct(s.annualized.CAGR, 1, false)} · vol ${fmtPct(s.annualized.vol, 0, false)}`)
               : tile('Annualized', 'held back', s.annualized_blocked_reason)}
           </div>
+
+          {s.n_reconstructed > 0 && (
+            <div style={{ marginTop: 10, fontSize: 11, color: theme.muted, lineHeight: 1.55,
+                           maxWidth: 760 }}>
+              <strong style={{ color: theme.text }}>
+                {s.n_reconstructed} of {s.n_segments} segments are reconstructed.
+              </strong>{' '}
+              Nobody saw those targets on the day. They were recomputed later from prices
+              up to each month-end, with the member list as it stood on the backfill date,
+              so a name that joined the index afterward can appear in them.{' '}
+              {s.live_only
+                ? 'The "Live entries only" figure leaves them out and scores the last live picks as held through the gap.'
+                : ''}
+            </div>
+          )}
 
           {dates.length > 1 ? (
             <div style={{ marginTop: 10 }}>
@@ -2067,6 +2236,13 @@ function LedgerPanel({ theme, accent, headingFont, benchmark, reloadKey }) {
                     <span style={{ color: theme.text }}>{x.name}</span>
                   </span>
                 ))}
+                {reconRanges.length > 0 && (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span style={{ width: 14, height: 0,
+                                    borderTop: `2px dashed ${accent.dark}` }} />
+                    <span style={{ color: theme.text }}>reconstructed</span>
+                  </span>
+                )}
                 <span>{s.equity_starts_at} → {s.priced_through}</span>
                 {!s.equity_covers_all_segments && (
                   <span style={{ color: '#b45309' }}>
@@ -2577,5 +2753,5 @@ Object.assign(window, {
   TopPerformersPanel, RollingSharpeChart, UnderwaterChart, SectorBarChart,
   PARAM_HELP, HelpTip, NumField, paramIssues, maxTopNFor, useViewport,
   RebalancePanel, EarningsBreakdown, BuildInfo, WhatsNewModal, RegimeBanner,
-  LedgerPanel, useLedgerRecorder,
+  LedgerPanel, useLedgerRecorder, LedgerNudge,
 });

@@ -142,12 +142,65 @@ def append(entry: dict) -> tuple[dict, bool]:
                 return max(in_month, key=lambda e: e.get("as_of") or ""), False
 
         entries.append(entry)
-        # allow_nan=False so a NaN in an entry fails here, loudly, instead of
-        # writing a file that json.loads will later reject as corrupt.
-        blob = json.dumps(
-            {"schema_version": SCHEMA_VERSION, "entries": entries},
-            indent=2, allow_nan=False,
-        )
-        DATA_DIR.mkdir(exist_ok=True)
-        cache.atomic_write(LEDGER_JSON, lambda p: p.write_text(blob))
+        _write(entries)
         return entry, True
+
+
+def _write(entries: list[dict]) -> None:
+    # allow_nan=False so a NaN in an entry fails here, loudly, instead of
+    # writing a file that json.loads will later reject as corrupt.
+    blob = json.dumps(
+        {"schema_version": SCHEMA_VERSION, "entries": entries},
+        indent=2, allow_nan=False,
+    )
+    DATA_DIR.mkdir(exist_ok=True)
+    cache.atomic_write(LEDGER_JSON, lambda p: p.write_text(blob))
+
+
+def append_many(new_entries: list[dict]) -> list[dict]:
+    """Add several entries in one write, or none of them.
+
+    Used by the backfill, where a half-filled gap is worse than either outcome.
+    Entries are applied in ascending ``as_of`` order and each must pass, against
+    the file plus the entries staged before it:
+
+    * its ``as_of`` is later than the newest entry of its hash;
+    * its calendar month holds no entry of its hash;
+    * if it is ``reconstructed``, an earlier *live* entry of its hash exists. A
+      reconstructed month is out-of-sample only for settings that were already
+      on record, so a backfill can never start a track record.
+
+    Any failure raises :class:`LedgerConflict` and leaves the file untouched.
+    Unlike :func:`append`, a duplicate is a conflict here, not a no-op: the
+    caller asked for an exact set of entries to exist together.
+    """
+    ordered = sorted(new_entries, key=lambda e: e["as_of"])
+    if not ordered:
+        return []
+
+    with _LOCK:
+        staged = load()
+        for entry in ordered:
+            as_of = entry["as_of"]
+            same_hash = _for_hash(staged, entry["params_hash"])
+            if same_hash:
+                newest = max((e.get("as_of") or "") for e in same_hash)
+                if as_of <= newest:
+                    raise LedgerConflict(
+                        f"as_of {as_of} is not later than the newest entry for these "
+                        f"settings ({newest}); nothing was written."
+                    )
+                if any((e.get("as_of") or "")[:7] == as_of[:7] for e in same_hash):
+                    raise LedgerConflict(
+                        f"{as_of[:7]} already has an entry for these settings; "
+                        f"nothing was written."
+                    )
+            if entry.get("reconstructed") and not any(
+                    not e.get("reconstructed") for e in same_hash):
+                raise LedgerConflict(
+                    "A reconstructed entry needs an earlier live entry with the same "
+                    "settings; nothing was written."
+                )
+            staged.append(entry)
+        _write(staged)
+        return ordered

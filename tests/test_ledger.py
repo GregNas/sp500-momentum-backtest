@@ -720,3 +720,306 @@ def test_ledger_endpoint_survives_a_missing_price_cache(tmp_path, monkeypatch):
     assert group["summary"]["total_return"] is None
     assert group["equity"]["dates"] == []
     assert out["warnings"]
+
+
+# ---- missed month-ends: the reminder and the backfill ---------------------
+
+_GAP_PARAMS = {"universe": "sp500", "topN": 3, "rankLookback": 1, "skipMonths": 0}
+_RECORD_KEYS = {"created", "entry", "reason", "as_of", "target_matches_stored",
+                "displayed_as_of_matches", "universe_source", "price_source",
+                "warnings", "status_messages"}
+
+
+def _last_bar_of(frame, period):
+    inside = frame.index[(frame.index >= period.start_time)
+                         & (frame.index <= period.end_time)]
+    return inside[-1]
+
+
+def _gap_setup(tmp_path, monkeypatch, months_back=4, **entry_extra):
+    """A ledger whose only entry sits ``months_back`` months before the frame's
+    last bar, so ``months_back - 1`` whole months have no entry."""
+    frame = _record_setup(tmp_path, monkeypatch)
+    last = frame.index[-1]
+    as_of = _last_bar_of(frame, last.to_period("M") - months_back)
+    ledger.append(_entry(as_of, ["T5", "T4", "T3"], frame,
+                         p_hash=ledger.params_hash(_GAP_PARAMS), **entry_extra))
+    monkeypatch.setattr(server, "_today", lambda: last.date())
+    return frame, as_of
+
+
+def _gap_request(policy=None):
+    return server.LedgerRecordParams(universe="sp500", topN=3, rankLookback=1,
+                                     skipMonths=0, benchmark="BENCH", gapPolicy=policy)
+
+
+@pytest.mark.parametrize("newest,upto,expected", [
+    ("2026-07-27", "2026-11-18", ["2026-08", "2026-09", "2026-10"]),
+    ("2026-07-27", "2026-08-03", []),              # consecutive months: no gap
+    ("2026-07-01", "2026-07-31", []),              # same month
+    ("2025-11-28", "2026-02-02", ["2025-12", "2026-01"]),   # across a year end
+    ("2026-07-27", "2026-06-30", []),              # upto before newest
+])
+def test_missed_months(newest, upto, expected):
+    assert analysis.ledger_missed_months(newest, upto) == expected
+
+
+@pytest.mark.parametrize("today,state", [
+    ("2026-07-30", "current"),
+    ("2026-08-04", "due"),
+    ("2026-11-18", "missed"),
+])
+def test_ledger_gap_states(today, state):
+    gap = analysis.ledger_gap("2026-07-27", today)
+    assert gap["state"] == state
+    assert bool(gap["missed_months"]) == (state == "missed")
+
+
+def test_reconstruct_equals_current_target_on_the_truncated_frame():
+    frame = _ramp_frame({t: 0.0005 * (i + 1) for i, t in enumerate(_UNIVERSE)})
+    period = frame.index[-1].to_period("M") - 2
+    bar = _last_bar_of(frame, period)
+
+    out = analysis.reconstruct_targets(frame, [str(period)], top_n=3, rank_lookback=1)
+    assert out[0]["refused_reason"] is None
+    assert out[0]["as_of"] == bar.strftime("%Y-%m-%d")
+    assert out[0]["target"] == analysis.current_target(
+        frame.loc[:bar], top_n=3, rank_lookback=1)
+
+
+def test_reconstruct_never_sees_a_later_bar():
+    # I3: after the month-end the slowest names become the fastest. A ranking
+    # that read one bar too far would pick them.
+    frame = _ramp_frame({t: 0.0005 * (i + 1) for i, t in enumerate(_UNIVERSE)})
+    period = frame.index[-1].to_period("M") - 2
+    bar = _last_bar_of(frame, period)
+    before = analysis.reconstruct_targets(frame, [str(period)], 3, 1)[0]["target"]
+
+    later = frame.index > bar
+    for i, t in enumerate(_UNIVERSE):
+        frame.loc[later, t] = frame[t].loc[bar] * (10.0 ** (len(_UNIVERSE) - i))
+    after = analysis.reconstruct_targets(frame, [str(period)], 3, 1)[0]["target"]
+    assert after == before
+    assert after["tickers"] == ["T5", "T4", "T3"]
+
+
+def test_reconstruct_refuses_a_month_the_frame_cannot_prove():
+    frame = _ramp_frame({t: 0.0005 * (i + 1) for i, t in enumerate(_UNIVERSE)})
+    last_month = str(frame.index[-1].to_period("M"))
+    first_month = str(frame.index[0].to_period("M"))
+    never = str(frame.index[-1].to_period("M") + 3)
+
+    out = {r["month"]: r for r in analysis.reconstruct_targets(
+        frame, [first_month, last_month, never], top_n=3, rank_lookback=1)}
+    # The frame's own last month has no later bar, so its last bar may be mid-month.
+    assert out[last_month]["target"] is None
+    assert "after that month" in out[last_month]["refused_reason"]
+    # The first month has no room for the ranking window behind it.
+    assert out[first_month]["target"] is None
+    assert "the signal needs" in out[first_month]["refused_reason"]
+    assert out[never]["target"] is None
+    assert out[never]["as_of"] is None
+
+
+def test_append_many_is_one_write_and_all_or_nothing(tmp_path, monkeypatch):
+    _point_ledger_at(tmp_path, monkeypatch)
+    frame = _ramp_frame({"A": 0.001, "B": 0.002})
+    days = frame.index
+    ledger.append(_entry(days[10], ["A", "B"], frame))
+    before = ledger.LEDGER_JSON.read_bytes()
+
+    writes = []
+    real = cache.atomic_write
+    monkeypatch.setattr(cache, "atomic_write",
+                        lambda dest, write: (writes.append(dest), real(dest, write))[1])
+
+    good = [_entry(days[60], ["A", "B"], frame, reconstructed=True),
+            _entry(days[100], ["A", "B"], frame, reconstructed=True)]
+    # The last entry falls in a month the first one already took: the whole set
+    # must be refused and the file left byte-identical.
+    clash = _entry(days[60] + pd.offsets.BDay(1), ["A", "B"], frame)
+    if clash["as_of"][:7] != good[0]["as_of"][:7]:
+        clash = _entry(days[60] - pd.offsets.BDay(1), ["A", "B"], frame)
+    with pytest.raises(ledger.LedgerConflict):
+        ledger.append_many(good + [clash])
+    assert ledger.LEDGER_JSON.read_bytes() == before
+    assert writes == []
+
+    stored = ledger.append_many(list(reversed(good)))
+    assert [e["as_of"] for e in stored] == sorted(e["as_of"] for e in good)
+    assert len(writes) == 1
+    assert [e["as_of"] for e in ledger.load()][1:] == [e["as_of"] for e in stored]
+
+
+def test_append_many_refuses_to_start_a_record_with_a_reconstruction(tmp_path, monkeypatch):
+    _point_ledger_at(tmp_path, monkeypatch)
+    frame = _ramp_frame({"A": 0.001, "B": 0.002})
+    with pytest.raises(ledger.LedgerConflict) as exc:
+        ledger.append_many([_entry(frame.index[50], ["A", "B"], frame, reconstructed=True)])
+    assert "live entry" in str(exc.value)
+    assert ledger.load() == []
+
+
+def test_record_with_a_gap_and_no_policy_writes_nothing(tmp_path, monkeypatch):
+    frame, as_of = _gap_setup(tmp_path, monkeypatch)
+    before = ledger.LEDGER_JSON.read_bytes()
+
+    out = server._record_ledger_target(_gap_request())
+    json.dumps(out, allow_nan=False)
+    last = frame.index[-1].to_period("M")
+    assert out["created"] is False
+    assert out["reason"] == "gap"
+    assert out["entry"] is None
+    assert out["missed"] == [str(last - 3), str(last - 2), str(last - 1)]
+    assert [r["ok"] for r in out["reconstructable"]] == [True, True, True]
+    assert out["newest_as_of"] == as_of.strftime("%Y-%m-%d")
+    assert ledger.LEDGER_JSON.read_bytes() == before
+
+
+def test_record_backfill_fills_the_gap_then_records(tmp_path, monkeypatch):
+    frame, as_of = _gap_setup(tmp_path, monkeypatch)
+
+    out = server._record_ledger_target(_gap_request("backfill"))
+    json.dumps(out, allow_nan=False)
+    assert out["created"] is True
+    assert len(out["backfilled"]) == 3
+
+    entries = ledger.load()
+    assert len(entries) == 5
+    as_ofs = [e["as_of"] for e in entries]
+    assert as_ofs == sorted(as_ofs)
+    assert [bool(e.get("reconstructed")) for e in entries] == [False, True, True, True, False]
+    last = frame.index[-1].to_period("M")
+    for e, back in zip(entries[1:4], (3, 2, 1)):
+        bar = _last_bar_of(frame, last - back)
+        assert e["as_of"] == bar.strftime("%Y-%m-%d")
+        # I1: the same cohort current_target gives on the frame cut at that bar,
+        # ranked over the narrowed universe.
+        assert e["tickers"] == analysis.current_target(
+            frame.loc[:bar, _UNIVERSE], top_n=3, rank_lookback=1)["tickers"]
+        assert e["entry_prices"]["T5"] == pytest.approx(frame["T5"].loc[bar])
+        assert e["benchmark_entry_date"] == e["as_of"]
+        assert e["universe_as_of"] == frame.index[-1].strftime("%Y-%m-%d")
+        assert e["params_hash"] == entries[0]["params_hash"]
+    assert entries[-1]["as_of"] == frame.index[-1].strftime("%Y-%m-%d")
+
+    # A second click the same month changes nothing and reports no gap.
+    again = server._record_ledger_target(_gap_request())
+    assert again["created"] is False
+    assert again["reason"] == "already_recorded"
+    assert len(ledger.load()) == 5
+
+
+def test_record_leave_keeps_the_gap_and_the_present_response(tmp_path, monkeypatch):
+    _gap_setup(tmp_path, monkeypatch)
+    out = server._record_ledger_target(_gap_request("leave"))
+    assert out["created"] is True
+    assert set(out) == _RECORD_KEYS                # I2: no new keys on this path
+    entries = ledger.load()
+    assert len(entries) == 2
+    assert not any(e.get("reconstructed") for e in entries)
+
+
+def test_record_without_a_gap_ignores_the_policy(tmp_path, monkeypatch):
+    # I2: a monthly cadence never sees the backfill, whatever the client sends.
+    _gap_setup(tmp_path, monkeypatch, months_back=1)
+    out = server._record_ledger_target(_gap_request("backfill"))
+    assert out["created"] is True
+    assert set(out) == _RECORD_KEYS
+    assert len(ledger.load()) == 2
+
+
+def test_record_backfill_needs_a_live_entry(tmp_path, monkeypatch):
+    # Reachable only through a hand-edited file, and still must not let a
+    # reconstruction stand in for a live record.
+    _gap_setup(tmp_path, monkeypatch, reconstructed=True)
+    before = ledger.LEDGER_JSON.read_bytes()
+
+    asked = server._record_ledger_target(_gap_request())
+    assert [r["ok"] for r in asked["reconstructable"]] == [False, False, False]
+    with pytest.raises(server.HTTPException) as exc:
+        server._record_ledger_target(_gap_request("backfill"))
+    assert exc.value.status_code == 409
+    assert ledger.LEDGER_JSON.read_bytes() == before
+
+
+def test_record_backfill_stops_at_the_month_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(analysis, "LEDGER_BACKFILL_MAX_MONTHS", 2)
+    frame, _ = _gap_setup(tmp_path, monkeypatch)
+    last = frame.index[-1].to_period("M")
+
+    asked = server._record_ledger_target(_gap_request())
+    assert asked["beyond_cap"] == [str(last - 3)]
+    assert [r["month"] for r in asked["reconstructable"]] == [str(last - 2), str(last - 1)]
+
+    out = server._record_ledger_target(_gap_request("backfill"))
+    assert len(out["backfilled"]) == 2
+    assert any("backfill limit" in w for w in out["warnings"])
+
+
+def test_ledger_endpoint_reports_the_gap(tmp_path, monkeypatch):
+    frame, as_of = _gap_setup(tmp_path, monkeypatch)
+    for today, state, n in ((as_of, "current", 0),
+                            (as_of + pd.offsets.MonthEnd(1), "due", 0),
+                            (as_of + pd.offsets.MonthEnd(4), "missed", 3)):
+        monkeypatch.setattr(server, "_today", lambda d=today: d.date())
+        out = server.ledger_history(params_hash=None, refresh=0)
+        json.dumps(out, allow_nan=False)
+        gap = out["groups"][0]["gap"]
+        assert gap["state"] == state
+        assert len(gap["missed_months"]) == n
+        assert gap["newest_as_of"] == as_of.strftime("%Y-%m-%d")
+        assert gap["prices_through"] == frame.index[-1].strftime("%Y-%m-%d")
+
+
+def test_marks_publish_the_live_only_total_beside_the_combined_one():
+    frame = _ramp_frame({"A": 0.001, "B": 0.003, "BENCH": 0.0005})
+    days = frame.index
+    entries = [
+        _entry(days[20], ["A"], frame),
+        _entry(days[60], ["B"], frame, reconstructed=True),
+        _entry(days[100], ["B"], frame, reconstructed=True),
+        _entry(days[140], ["A"], frame),
+    ]
+    out = analysis.ledger_marks(entries, frame, benchmark="BENCH")
+    json.dumps(out, allow_nan=False)
+    s = out["summary"]
+    assert s["n_reconstructed"] == 2
+    assert [r["reconstructed"] for r in out["rows"]] == [False, True, True, False]
+
+    live = analysis.ledger_marks([entries[0], entries[3]], frame, benchmark="BENCH")
+    assert live["summary"]["live_only"] is None
+    assert s["live_only"] == {
+        "total_return": live["summary"]["total_return"],
+        "benchmark_total_return": live["summary"]["benchmark_total_return"],
+        "excess": live["summary"]["excess"],
+        "n_segments": 2,
+    }
+    # B out-runs A, so holding B through the gap must beat holding A through it.
+    assert s["total_return"] > s["live_only"]["total_return"]
+    # Adjacent reconstructed segments merge into one drawn range.
+    assert out["equity"]["reconstructed_ranges"] == [
+        [days[60].strftime("%Y-%m-%d"), days[140].strftime("%Y-%m-%d")]]
+
+
+def test_record_refetches_when_the_universe_stops_short_of_the_frame(tmp_path, monkeypatch):
+    # The frame's last bar is recent because of 1 column only. The age check
+    # alone reads that as fresh and records off the holed cache, which refuses
+    # with "Only 1 of 3 names". The lag check must send it to get_prices.
+    frame = _record_setup(tmp_path, monkeypatch)
+    holed = frame.copy()
+    holed.iloc[-30:, [holed.columns.get_loc(t) for t in _UNIVERSE[:-1]]] = np.nan
+    cache._save(holed)
+    calls = []
+    monkeypatch.setattr(data, "get_prices",
+                        lambda tickers, start, end, on_status=None: (
+                            calls.append(tickers),
+                            frame[[t for t in tickers if t in frame.columns]])[1])
+
+    out = server._record_ledger_target(server.LedgerRecordParams(
+        universe="sp500", topN=3, rankLookback=1, benchmark="BENCH"))
+    assert calls
+    assert out["created"] is True
+    assert out["price_source"] == "fetched"
+    assert out["entry"]["tickers"] == analysis.current_target(
+        frame[_UNIVERSE], top_n=3, rank_lookback=1)["tickers"]
